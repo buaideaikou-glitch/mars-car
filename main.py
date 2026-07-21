@@ -23,6 +23,14 @@ ALIGN_THRESHOLD = 5
 ALIGN_COUNT_NEEDED = 10
 align_count = 0
 
+# 抓取超时：无ok回传时默认成功进入下一块（秒）
+GRAB_TIMEOUT_SEC = 25.0
+ok_wait_start = 0.0
+
+# 已抓物块位置记录，防止重复抓取同一块
+grabbed_positions = []
+grabbed_block_pos = None
+
 # 抓取状态
 waiting_ok = False            # 对准后等待小车ok
 car_grab_ok = False           # 收到ok
@@ -88,11 +96,8 @@ def uart_receive_thread(serial):
                     stuts = decoded
                     
                     if "ok" in decoded.lower():
-                        if waiting_ok:
-                            car_grab_ok = True
-                            print("[UART RX] ✅ 收到ok！")
-                        else:
-                            print("[UART RX] ❌ 忽略ok（未对准，延迟信号）")
+                        car_grab_ok = True
+                        print("[UART RX] ✅ 收到ok！")
             except:
                 pass
         time.sleep(0.01)
@@ -257,6 +262,14 @@ def find_closest_block(img, target_color):
     blocks = find_blocks_by_color(img, target_color)
     if not blocks:
         return None
+    # 过滤掉已抓过的物块（60像素半径内）
+    if grabbed_positions:
+        blocks = [b for b in blocks if not any(
+            abs(b['center_x'] - gx) < 60 and abs(b['center_y'] - gy) < 60
+            for gx, gy in grabbed_positions
+        )]
+    if not blocks:
+        return None
     blocks.sort(key=lambda b: b['distance'])
     return blocks[0]
 
@@ -347,7 +360,8 @@ def draw_ui(img, block, color_en, grab_count, remaining_count, locked, align_cnt
 
 def phase_detect_and_send():
     global current_color, remaining_count, grab_count, system_active
-    global locked_block, align_count, lock_lost_count, waiting_ok, car_grab_ok
+    global locked_block, align_count, lock_lost_count, waiting_ok, car_grab_ok, ok_wait_start
+    global grabbed_positions, grabbed_block_pos
     
     cn_names = {"red": "红色", "blue": "蓝色", "yellow": "黄色", "purple": "紫色", "pink": "粉色"}
     
@@ -372,6 +386,8 @@ def phase_detect_and_send():
         lock_lost_count = 0
         waiting_ok = False
         car_grab_ok = False
+        ok_wait_start = 0.0
+        grabbed_positions.clear()
         
         color_cn = cn_names.get(color_en, color_en)
         print(f"\\n{'='*30}")
@@ -384,6 +400,9 @@ def phase_detect_and_send():
             # ====== 收到ok，抓取完成 ======
             if car_grab_ok:
                 print(f"[COMPLETE] {color_cn} 第{grab_count+1}块 抓取完成!")
+                if grabbed_block_pos:
+                    grabbed_positions.append(grabbed_block_pos)
+                    grabbed_block_pos = None
                 grab_count += 1
                 
                 locked_block = None
@@ -403,6 +422,12 @@ def phase_detect_and_send():
             
             # ====== 等待ok中，不发偏移 ======
             if waiting_ok:
+                # ok 回传失败时超时默认成功，自动进入下一块
+                if time.time() - ok_wait_start > GRAB_TIMEOUT_SEC:
+                    print("[ALIGN] ok超时，默认抓取成功，进入下一块")
+                    car_grab_ok = True
+                    waiting_ok = False
+                
                 if locked_block is not None:
                     tracked = find_locked_block(img, color_en, locked_block)
                     if tracked:
@@ -449,10 +474,13 @@ def phase_detect_and_send():
                     align_count += 1
                     if align_count >= ALIGN_COUNT_NEEDED:
                         print(f"[ALIGN] {color_cn} 第{grab_count+1}块 已对准! dx={dx:+d} dy={dy:+d}")
-                        print("[ALIGN] 停止发偏移，等待ok...")
+                        print("[ALIGN] 停止发偏移，等待小车抓取...")
+                        if block:
+                            grabbed_block_pos = (block['center_x'], block['center_y'])
                         send_offset(0, 0)
                         waiting_ok = True
                         car_grab_ok = False
+                        ok_wait_start = time.time()
                 else:
                     if align_count > 0:
                         print(f"[DEBUG] 超出范围! dx={dx:+d} dy={dy:+d}")
