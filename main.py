@@ -526,9 +526,26 @@ system_active = False
 waiting_ok = False
 car_grab_ok = False
 
-phase_qr_scan()
-
-if task_parsed and len(task_queue) > 0:
-    phase_detect_and_send()
+while not app.need_exit():
+    task_parsed = False
+    grabbed_positions.clear()
+    grabbed_block_pos = None
+    system_active = False
+    waiting_ok = False
+    car_grab_ok = False
+    
+    phase_qr_scan()
+    
+    if task_parsed and len(task_queue) > 0:
+        phase_detect_and_send()
+    
+    print("\\n[INFO] 返回初始状态，等待扫描新二维码...")
+    for _ in range(30):
+        if app.need_exit():
+            break
+        img = cam_block.read()
+        img.draw_string(180, 200, "扫描新二维码...", image.COLOR_GREEN, 2.5)
+        disp.show(img)
+        time.sleep(0.1)
 
 print("\\n[END] 程序结束")
