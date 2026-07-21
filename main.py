@@ -1,111 +1,506 @@
-from maix import camera, display, image, app, uart, time
+from maix import camera, display, image, uart, app, time
 import threading
+import re
 
-xunhuan_num = 0
-thresholds_red   = [[20, 60, 35, 80, 10, 40]]    # red
-thresholds_blue = [[25, 70, -20, 15, -75, -25]]    # blue
-thresholds_yellow = [[50, 100, -30,  10, 60, 100]]    # yellow
-thresholds_pink = [[40, 70, 10, 40, -5, 10]]
-thresholds_purple = [[-5, 55, 10, 50, -60, -10]]
-# 串口初始化
+# ============ 全局变量 ============
+stuts = ""
+task_parsed = False
+task_queue = []
+current_color = None
+remaining_count = 0
+grab_count = 0
+last_send_time = 0
+send_interval = 0.2
+center_x, center_y = 320, 240
+send_success = False
+send_success_time = 0
+send_data = ""
+locked_block = None
+system_active = False
+
+# 对准容差
+ALIGN_THRESHOLD = 5
+ALIGN_COUNT_NEEDED = 10
+align_count = 0
+
+# 抓取状态
+waiting_ok = False            # 对准后等待小车ok
+car_grab_ok = False           # 收到ok
+
+# 锁定丢失容忍度
+LOCK_LOST_TOLERANCE = 10
+lock_lost_count = 0
+
+# ============ 色块识别阈值 ============
+thresholds = {
+    "red": [
+        [0, 35, 30, 80, 18, 62],       # 红色下限
+        [23, 43, 45, 65, 26, 46],      # 中心红色：原22-42改为20-44，给±2的抖动空间
+        [148, 180, 38, 80, 28, 62]     # 红色高H
+    ],
+    "blue": [
+        [18, 47, -22, 22, -62, -18],   # 蓝色扩展范围
+        [32, 52, -10, 10, -53, -33],   # 中心蓝色：原29-49改为27-51，给±2的抖动空间
+        [8, 42, -32, 2, -72, -38]      # 暗部蓝色
+    ],
+    "yellow": [
+        [48, 87, -18, 18, 48, 92],     # 黄色扩展范围
+        [52, 72, -6, 14, 56, 76],     # 中心黄色：根据57,77采样，给±2空间
+        [42, 72, -22, 22, 42, 98]      # 亮/暗部黄色
+    ],
+    "purple": [
+        [6, 26, 23, 43, -43, -23],     # 中心紫色：根据1,21采样，给±2空间
+        [0, 37, 33, 72, -92, -48],     # 紫色扩展
+        [13, 42, 28, 52, -72, -38]     # 中间紫色
+    ],
+    "pink": [
+        [38, 72, 3, 37, -62, -18],     # 粉色扩展
+        [54, 74, 17, 37, -8, 12],      # 中心粉色：原41-61改为39-63，给±2空间
+        [33, 62, -3, 28, -72, -38]     # 暗部粉色
+    ]
+}
+
+color_draw = {
+    "red": image.COLOR_RED,
+    "blue": image.COLOR_BLUE,
+    "yellow": image.COLOR_YELLOW,
+    "purple": image.COLOR_PURPLE,
+    "pink": image.COLOR_BLACK
+}
+
+# ============ 初始化 ============
+cam_qr = camera.Camera(320, 240)
+cam_block = camera.Camera(640, 480)
+disp = display.Display()
+
 device = "/dev/ttyS0"
 serial = uart.UART(device, 115200)
 
-def re_uart(serial):
-    while 1:
+def uart_receive_thread(serial):
+    global stuts, car_grab_ok
+    while True:
         data = serial.read()
         if data:
-            data = data.decode("utf-8", errors="ignore")
-            print(f"uart0:{data}")
-        time.sleep_ms(5)
+            try:
+                decoded = data.decode("utf-8", errors="ignore").strip()
+                if decoded:
+                    print(f"[UART RX] {decoded}")
+                    stuts = decoded
+                    
+                    if "ok" in decoded.lower():
+                        if waiting_ok:
+                            car_grab_ok = True
+                            print("[UART RX] ✅ 收到ok！")
+                        else:
+                            print("[UART RX] ❌ 忽略ok（未对准，延迟信号）")
+            except:
+                pass
+        time.sleep(0.01)
 
-uart0_thread = threading.Thread(target=re_uart, args=(serial,))
-uart0_thread.daemon = True
-uart0_thread.start()
+uart_thread = threading.Thread(target=uart_receive_thread, args=(serial,))
+uart_thread.daemon = True
+uart_thread.start()
 
-#摄像头初始化
-cam = camera.Camera(320, 240, fps=60 ) 
-disp = display.Display()
-
-while not app.need_exit():
-    img = cam.read()
+def send_offset(dx, dy):
+    global last_send_time, send_success, send_success_time, send_data
     
-    if xunhuan_num >= 1:  #60帧判断一次
-        blobs = img.find_blobs(thresholds_red, pixels_threshold=10)  #pixels_threshold 色块阈值
-        last_x_state=''
-        last_y_state=''
-        if blobs != [] :    #判断是否识别成功
-            for blob in blobs:
-                print("red")
-                print(blob[0], blob[1], blob[2], blob[3], blob[5], blob[6])                 # 左上角为0点 矩形框选 （x, y, 宽，高, 中心点X, 中心点Y ）
-                offset_x=blob[5]-160
-                offset_y=blob[6]-120
-                #判断当前状态
-                if offset_x>20:
-                    current_x_state='向右移动'
-                elif offset_x<-20:
-                    current_x_state='向左移动'
-                else:
-                    current_x_state='已对准'
+    if not system_active or waiting_ok:
+        return
+    
+    current_time = time.time()
+    if current_time - last_send_time < send_interval:
+        return
+    last_send_time = current_time
+    
+    dx = int(dx)
+    dy = int(dy)
+    data = f"{dx} {dy}\n"
+    
+    try:
+        serial.write_str(data.encode('utf-8'))
+        send_success = True
+        send_success_time = current_time
+        send_data = data
+        print(f"[UART TX] X{dx:+d} Y{dy:+d}")
+    except Exception as e:
+        print(f"[UART TX] 发送失败: {e}")
 
-                if offset_y>20:
-                    current_y_state='向下移动'
-                elif offset_y<-20:
-                    current_y_state='向上移动'
-                else:
-                    current_y_state='已对准'
-                #触发输出
-                if current_x_state!=last_x_state or current_y_state!=last_y_state:
-                    print(f"{current_x_state} {current_y_state}")
-                    last_x_state=current_x_state
-                    last_y_state=current_y_state
+def parse_qr_task(qr_text):
+    global task_queue, task_parsed
+    
+    print(f"\\n[QR] {qr_text}")
+    
+    text = qr_text.lower().strip()
+    color_names = {
+        "red": "red", "红": "red", "红色": "red",
+        "blue": "blue", "蓝": "blue", "蓝色": "blue",
+        "yellow": "yellow", "黄": "yellow", "黄色": "yellow",
+        "purple": "purple", "紫": "purple", "紫色": "purple",
+        "pink": "pink", "粉": "pink", "粉色": "pink"
+    }
+    
+    task_queue = []
+    
+    parts = text.split()
+    if len(parts) >= 4:
+        colors_part = []
+        numbers_part = []
+        for part in parts:
+            if part in color_names:
+                colors_part.append(color_names[part])
+            elif part.isdigit():
+                numbers_part.append(int(part))
+        if colors_part and numbers_part and len(colors_part) == len(numbers_part):
+            task_queue = list(zip(colors_part, numbers_part))
+    
+    if not task_queue:
+        pattern = r'(红|蓝|黄|紫|粉)(?:色)?(\\d+)块?'
+        matches = re.findall(pattern, qr_text)
+        if matches:
+            for color, count in matches:
+                color_en = color_names.get(color)
+                if color_en:
+                    task_queue.append((color_en, int(count)))
+    
+    if not task_queue:
+        pattern = r'(red|blue|yellow|purple|pink)(\\d+)'
+        matches = re.findall(pattern, text)
+        if matches:
+            for color, count in matches:
+                task_queue.append((color, int(count)))
+    
+    if task_queue:
+        task_parsed = True
+        cn_names = {"red": "红色", "blue": "蓝色", "yellow": "黄色", "purple": "紫色", "pink": "粉色"}
+        print("[TASK] 解析成功:")
+        for color_en, count in task_queue:
+            print(f"  {cn_names[color_en]}: {count}块")
+        return True
+    
+    print("[TASK] 解析失败")
+    return False
 
-                img.draw_rect(blob[0], blob[1], blob[2], blob[3], image.COLOR_RED, 5)       # 左上角为0点 矩形框选 （x, y, 宽，高, 线色, 线宽 ）
-
-        blobs = img.find_blobs(thresholds_blue, pixels_threshold=10)  #pixels_threshold 色块阈值
-        if blobs != [] :    #判断是否识别成功
-            for blob in blobs:
-                print("blue")
-                print(blob[0], blob[1], blob[2], blob[3], blob[5], blob[6])                 # 左上角为0点 矩形框选 （x, y, 宽，高, 中心点X, 中心点Y ）
-                img.draw_rect(blob[0], blob[1], blob[2], blob[3], image.COLOR_BLUE, 5)     # 左上角为0点 矩形框选 （x, y, 宽，高, 线色, 线宽）
-
-
-        blobs = img.find_blobs(thresholds_yellow, pixels_threshold=10)  #pixels_threshold 色块阈值
-        if blobs != [] :    #判断是否识别成功
-            for blob in blobs:
-                print("yellow")
-                print(blob[0], blob[1], blob[2], blob[3], blob[5], blob[6])                 # 左上角为0点 矩形框选 （x, y, 宽，高, 中心点X, 中心点Y ）
-                img.draw_rect(blob[0], blob[1], blob[2], blob[3], image.COLOR_YELLOW, 5)     # 左上角为0点 矩形框选 （x, y, 宽，高, 线色, 线宽）
-        
-        blobs = img.find_blobs(thresholds_pink, pixels_threshold=30)  #pixels_threshold 色块阈值
-        if blobs != [] :    #判断是否识别成功
-            for blob in blobs:
-                print("pink")
-                print(blob[0], blob[1], blob[2], blob[3], blob[5], blob[6])                 # 左上角为0点 矩形框选 （x, y, 宽，高, 中心点X, 中心点Y ）
-                img.draw_rect(blob[0], blob[1], blob[2], blob[3], image.COLOR_WHITE, 5)     # 左上角为0点 矩形框选 （x, y, 宽，高, 线色, 线宽）
-        
-        blobs = img.find_blobs(thresholds_purple, pixels_threshold=10)  #pixels_threshold 色块阈值
-        if blobs != [] :    #判断是否识别成功
-            for blob in blobs:
-                print("purple")
-                print(blob[0], blob[1], blob[2], blob[3], blob[5], blob[6])                 # 左上角为0点 矩形框选 （x, y, 宽，高, 中心点X, 中心点Y ）
-                img.draw_rect(blob[0], blob[1], blob[2], blob[3], image.COLOR_BLACK, 5)     # 左上角为0点 矩形框选 （x, y, 宽，高, 线色, 线宽）
-
-
-        # 二维码识别
+def phase_qr_scan():
+    global task_parsed
+    
+    print("\\n" + "="*50)
+    print("阶段1: 扫描二维码")
+    print("="*50)
+    
+    while not task_parsed and not app.need_exit():
+        img = cam_qr.read()
         qrcodes = img.find_qrcodes()
+        
         for qr in qrcodes:
             corners = qr.corners()
             for i in range(4):
                 img.draw_line(corners[i][0], corners[i][1],
-                              corners[(i + 1) % 4][0], corners[(i + 1) % 4][1],
-                              image.COLOR_RED)
-            img.draw_string(qr.x(), qr.y() - 15, qr.payload(), image.COLOR_RED)
-            print(qr.payload())
-            serial.write_str(qr.payload())
+                             corners[(i+1)%4][0], corners[(i+1)%4][1],
+                             image.COLOR_RED, 2)
+            
+            qr_text = qr.payload()
+            img.draw_string(qr.x(), qr.y()-15, qr_text, image.COLOR_RED, 1.5)
+            
+            if parse_qr_task(qr_text):
+                disp.show(img)
+                time.sleep(1)
+                return
+        
+        img.draw_string(10, 10, "扫描二维码中...", image.COLOR_GREEN, 1.5)
+        disp.show(img)
+        time.sleep(0.1)
 
-        xunhuan_num = 0
+def find_blocks_by_color(img, target_color):
+    if target_color not in thresholds:
+        return []
+    
+    all_blobs = []
+    for thresh in thresholds[target_color]:
+        blobs = img.find_blobs([thresh], pixels_threshold=200, area_threshold=300, merge=True)
+        if blobs:
+            all_blobs.extend(blobs)
+    
+    if not all_blobs:
+        return []
+    
+    valid_blocks = []
+    for blob in all_blobs:
+        x, y, w, h = blob[0], blob[1], blob[2], blob[3]
+        cx, cy = blob[5], blob[6]
+        area = blob.area()
+        
+        if area < 300 or w < 10 or h < 10 or w > 250 or h > 250:
+            continue
+        
+        overlap = False
+        for idx, existing in enumerate(valid_blocks):
+            if abs(cx - existing['center_x']) < 50 and abs(cy - existing['center_y']) < 50:
+                overlap = True
+                if area > existing['area']:
+                    valid_blocks[idx] = {
+                        'x': x, 'y': y, 'width': w, 'height': h,
+                        'center_x': cx, 'center_y': cy, 'area': area,
+                        'distance': ((cx - center_x)**2 + (cy - center_y)**2)**0.5
+                    }
+                break
+        
+        if not overlap:
+            valid_blocks.append({
+                'x': x, 'y': y, 'width': w, 'height': h,
+                'center_x': cx, 'center_y': cy, 'area': area,
+                'distance': ((cx - center_x)**2 + (cy - center_y)**2)**0.5
+            })
+    
+    return valid_blocks
 
-    img.draw_rect( 320, 240, 30, 30, image.COLOR_RED, 5)   #在中心绘制中心点
-    xunhuan_num = xunhuan_num + 1  
-    disp.show(img)
+def find_closest_block(img, target_color):
+    blocks = find_blocks_by_color(img, target_color)
+    if not blocks:
+        return None
+    blocks.sort(key=lambda b: b['distance'])
+    return blocks[0]
+
+def find_locked_block(img, target_color, locked):
+    blocks = find_blocks_by_color(img, target_color)
+    if not blocks:
+        return None
+    
+    best_match = None
+    best_score = 999999
+    
+    for block in blocks:
+        dx = block['center_x'] - locked['center_x']
+        dy = block['center_y'] - locked['center_y']
+        dw = block['width'] - locked['width']
+        dh = block['height'] - locked['height']
+        
+        position_diff = (dx**2 + dy**2) ** 0.5
+        size_diff = ((dw**2 + dh**2) ** 0.5) / max(locked['width'], locked['height'], 1)
+        score = position_diff * 0.6 + size_diff * 100 * 0.4
+        
+        if score < best_score:
+            best_score = score
+            best_match = block
+    
+    if best_match and best_score < 80:
+        return best_match
+    return None
+
+def draw_ui(img, block, color_en, grab_count, remaining_count, locked, align_cnt, lost_cnt):
+    global send_success, send_success_time, send_data, stuts
+    
+    cn_names = {"red": "红色", "blue": "蓝色", "yellow": "黄色", "purple": "紫色", "pink": "粉色"}
+    color_cn = cn_names.get(color_en, color_en)
+    
+    # 中心十字
+    img.draw_cross(center_x, center_y, image.COLOR_WHITE, size=20, thickness=2)
+    img.draw_circle(center_x, center_y, 8, image.COLOR_WHITE, 2)
+    
+    # 对准框
+    box_color = image.COLOR_RED if waiting_ok else image.COLOR_GREEN
+    img.draw_rect(center_x - ALIGN_THRESHOLD, center_y - ALIGN_THRESHOLD,
+                  ALIGN_THRESHOLD * 2, ALIGN_THRESHOLD * 2, box_color, 2)
+    
+    # 状态栏
+    img.draw_rect(0, 0, 640, 105, image.COLOR_BLACK, -1)
+    img.draw_rect(0, 0, 640, 105, image.COLOR_WHITE, 1)
+    
+    img.draw_string(10, 5, f"目标: {color_cn} [{grab_count}/{remaining_count}]", image.COLOR_GREEN, 1.5)
+    
+    if waiting_ok:
+        img.draw_string(400, 5, "⏳等待ok...", image.COLOR_YELLOW, 1.5)
+    elif system_active:
+        img.draw_string(500, 5, "●活动", image.COLOR_GREEN, 1.2)
+    
+    if locked:
+        img.draw_string(550, 25, "🔒锁定", image.COLOR_RED, 1.0)
+    
+    if block:
+        draw_color = color_draw.get(color_en, image.COLOR_GREEN)
+        img.draw_rect(block['x'], block['y'], block['width'], block['height'], draw_color, 3)
+        
+        bx, by = int(block['center_x']), int(block['center_y'])
+        img.draw_cross(bx, by, draw_color, size=10, thickness=2)
+        img.draw_line(bx, by, center_x, center_y, image.COLOR_YELLOW, 1)
+        
+        dx = int(block['center_x'] - center_x)
+        dy = int(block['center_y'] - center_y)
+        
+        offset_color = image.COLOR_GREEN if abs(dx) <= ALIGN_THRESHOLD and abs(dy) <= ALIGN_THRESHOLD else image.COLOR_YELLOW
+        img.draw_string(10, 25, f"偏移: X{dx:+d} Y{dy:+d}", offset_color, 1.5)
+        
+        if waiting_ok:
+            img.draw_string(10, 45, "✓ 已对准，等待小车ok...", image.COLOR_GREEN, 1.5)
+        elif align_cnt > 0:
+            img.draw_string(10, 45, f"对准中 [{align_cnt}/{ALIGN_COUNT_NEEDED}]", image.COLOR_GREEN, 1.5)
+        else:
+            img.draw_string(10, 45, "↔ 调整中...", image.COLOR_YELLOW, 1.5)
+    else:
+        img.draw_string(10, 25, "偏移: ---  ---", image.COLOR_RED, 1.5)
+        img.draw_string(10, 45, "🔍 搜索中...", image.COLOR_RED, 1.5)
+    
+    current_time = time.time()
+    if send_success and (current_time - send_success_time) < 1.0:
+        img.draw_string(10, 65, f"📤 {send_data}", image.COLOR_GREEN, 1.5)
+    if stuts:
+        img.draw_string(10, 85, f"📥 {stuts}", image.COLOR_BLUE, 1.5)
+
+def phase_detect_and_send():
+    global current_color, remaining_count, grab_count, system_active
+    global locked_block, align_count, lock_lost_count, waiting_ok, car_grab_ok
+    
+    cn_names = {"red": "红色", "blue": "蓝色", "yellow": "黄色", "purple": "紫色", "pink": "粉色"}
+    
+    print("\\n" + "="*50)
+    print("阶段2: 物块识别与偏移发送")
+    print("="*50)
+    
+    system_active = True
+    print(f"[INFO] 对准条件: |dx|≤{ALIGN_THRESHOLD} |dy|≤{ALIGN_THRESHOLD}, 连续{ALIGN_COUNT_NEEDED}帧")
+    print("[INFO] 对准后停止发偏移，等待小车ok")
+    
+    print("[INFO] 等待移动到物块区...")
+    time.sleep(2)
+    
+    for idx, (color_en, count) in enumerate(task_queue):
+        current_color = color_en
+        remaining_count = count
+        grab_count = 0
+        
+        locked_block = None
+        align_count = 0
+        lock_lost_count = 0
+        waiting_ok = False
+        car_grab_ok = False
+        
+        color_cn = cn_names.get(color_en, color_en)
+        print(f"\\n{'='*30}")
+        print(f"[TASK] {color_cn}: {count}块 ({idx+1}/{len(task_queue)})")
+        print(f"{'='*30}")
+        
+        while grab_count < remaining_count and not app.need_exit():
+            img = cam_block.read()
+            
+            # ====== 收到ok，抓取完成 ======
+            if car_grab_ok:
+                print(f"[COMPLETE] {color_cn} 第{grab_count+1}块 抓取完成!")
+                grab_count += 1
+                
+                locked_block = None
+                align_count = 0
+                lock_lost_count = 0
+                waiting_ok = False
+                car_grab_ok = False
+                
+                if grab_count >= remaining_count:
+                    print(f"[DONE] {color_cn} 全部完成!")
+                    time.sleep(0.5)
+                    break
+                
+                print(f"[NEXT] 准备下一块 ({grab_count}/{remaining_count})")
+                time.sleep(0.3)
+                continue
+            
+            # ====== 等待ok中，不发偏移 ======
+            if waiting_ok:
+                if locked_block is not None:
+                    tracked = find_locked_block(img, color_en, locked_block)
+                    if tracked:
+                        locked_block = tracked
+                
+                draw_ui(img, locked_block, color_en, grab_count, remaining_count,
+                       locked_block is not None, align_count, lock_lost_count)
+                disp.show(img)
+                time.sleep(0.05)
+                continue
+            
+            # ====== 正常识别调整 ======
+            block = None
+            
+            if locked_block is not None:
+                tracked = find_locked_block(img, color_en, locked_block)
+                if tracked:
+                    locked_block = tracked
+                    block = tracked
+                    lock_lost_count = 0
+                else:
+                    lock_lost_count += 1
+                    if lock_lost_count < LOCK_LOST_TOLERANCE:
+                        block = locked_block
+                    else:
+                        print(f"[LOST] 丢失{lock_lost_count}帧，重新搜索")
+                        locked_block = None
+                        lock_lost_count = 0
+                        align_count = 0
+                        block = find_closest_block(img, color_en)
+            else:
+                block = find_closest_block(img, color_en)
+                if block:
+                    locked_block = block
+                    lock_lost_count = 0
+                    align_count = 0
+                    print(f"[LOCK] 锁定{color_cn}: ({block['center_x']:.0f}, {block['center_y']:.0f})")
+            
+            if block:
+                dx = int(block['center_x'] - center_x)
+                dy = int(block['center_y'] - center_y)
+                
+                if abs(dx) <= ALIGN_THRESHOLD and abs(dy) <= ALIGN_THRESHOLD:
+                    align_count += 1
+                    if align_count >= ALIGN_COUNT_NEEDED:
+                        print(f"[ALIGN] {color_cn} 第{grab_count+1}块 已对准! dx={dx:+d} dy={dy:+d}")
+                        print("[ALIGN] 停止发偏移，等待ok...")
+                        send_offset(0, 0)
+                        waiting_ok = True
+                        car_grab_ok = False
+                else:
+                    if align_count > 0:
+                        print(f"[DEBUG] 超出范围! dx={dx:+d} dy={dy:+d}")
+                    align_count = 0
+                    send_offset(dx, dy)
+            else:
+                locked_block = None
+                align_count = 0
+                lock_lost_count = 0
+                if grab_count < remaining_count:
+                    send_offset(999, 999)
+            
+            draw_ui(img, block, color_en, grab_count, remaining_count,
+                   locked_block is not None, align_count, lock_lost_count)
+            disp.show(img)
+            time.sleep(0.05)
+    
+    print("\\n" + "="*50)
+    print("[TASK_COMPLETE] 所有任务完成")
+    print("="*50)
+    
+    system_active = False
+    waiting_ok = False
+    current_color = None
+    
+    for _ in range(20):
+        if app.need_exit():
+            break
+        img = cam_block.read()
+        img.draw_rectangle(0, 0, 640, 480, image.COLOR_BLACK, -1)
+        img.draw_string(180, 200, "所有任务完成!", image.COLOR_GREEN, 2.5)
+        img.draw_string(200, 250, "系统已停止", image.COLOR_RED, 2)
+        disp.show(img)
+        time.sleep(0.1)
+    
+    print("\\n[DONE] 程序执行完毕")
+
+print("\\n" + "="*50)
+print("视觉伺服物块抓取系统")
+print("="*50)
+
+system_active = False
+waiting_ok = False
+car_grab_ok = False
+
+phase_qr_scan()
+
+if task_parsed and len(task_queue) > 0:
+    phase_detect_and_send()
+
+print("\\n[END] 程序结束")
