@@ -109,7 +109,7 @@ class RobotArm:
         )
 
     def pick_and_place(self, pick_angles, place_angles,
-                       gripper_id=15, gripper_open_deg=0, gripper_close_deg=65,
+                       gripper_id=15, gripper_open_deg=0, gripper_close_deg=80,
                        arm_speed=60.0, gripper_speed=60.0):
         """
         抓取-放置复合动作：

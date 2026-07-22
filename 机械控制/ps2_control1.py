@@ -35,7 +35,7 @@ row = 1.5
 # 抓取/放置过程中使用的固定参数
 _GRIPPER_SERVO_ID = 15       # 夹爪舵机 ID（与 L1/R1 手动控制一致）
 _GRIPPER_OPEN_DEG = 0.0      # 夹爪松开角度（对应 L1）
-_GRIPPER_CLOSE_DEG = 65.0    # 夹爪夹紧角度（对应 R1）
+_GRIPPER_CLOSE_DEG = 80.0    # 夹爪夹紧角度（对应 R1）
 _ARM_GRAB_SPEED = 60.0       # 抓取过程中机械臂运动速度 (deg/s)
 _GRIPPER_SETTLE_MS = 1200    # 夹爪动作后的等待时间
 _ARM_SERVO_IDS = (7, 9, 10, 11)  # 机械臂四个关节舵机 ID
@@ -144,13 +144,13 @@ def handle_arm_control(rover, ps2, buttons, lx, ly, rx, ry):
     if rover.arm is None:
         return
 
-    # 【L1 键】松开夹爪（0°），【R1 键】夹紧夹爪（65°）
+    # 【L1 键】松开夹爪（0°），【R1 键】夹紧夹爪（80°）
     if button_pressed(buttons, ps2.PS2_BTN_L1):
         rover.arm.servo_control.set_reserve_servo_angle(15, 0.0, speed_deg_s=60.0)
         time.sleep_ms(_ARM_JOG_COMMAND_DELAY_MS)
         return
     if button_pressed(buttons, ps2.PS2_BTN_R1):
-        rover.arm.servo_control.set_reserve_servo_angle(15, 65.0, speed_deg_s=60.0)
+        rover.arm.servo_control.set_reserve_servo_angle(15, 80.0, speed_deg_s=60.0)
         time.sleep_ms(_ARM_JOG_COMMAND_DELAY_MS)
         return
 
