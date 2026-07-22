@@ -84,7 +84,7 @@ device = "/dev/ttyS0"
 serial = uart.UART(device, 115200)
 
 def uart_receive_thread(serial):
-    global stuts, car_grab_ok, waiting_ok
+    global stuts, car_grab_ok
     while True:
         data = serial.read()
         if data:
@@ -93,7 +93,7 @@ def uart_receive_thread(serial):
                 if decoded:
                     stuts = decoded
                     
-                    if "ok" in decoded.lower() and waiting_ok:
+                    if "ok" in decoded.lower():
                         car_grab_ok = True
                         print("[UART RX] ✅ 收到有效的抓取完成ok！")
             except:
