@@ -31,6 +31,8 @@ grab_mode = False          # 是否处于抓取模式
 grab_cooldown = False      # 抓取冷却
 grab_cooldown_time = 0     # 冷却开始时间
 row = 1.5
+backup_mode = False        # 后退模式：True=正在后退拉开dy
+backup_done = False        # 本周期已后退过，防止对齐时再次触发
 
 # 抓取/放置过程中使用的固定参数
 _GRIPPER_SERVO_ID = 15       # 夹爪舵机 ID（与 L1/R1 手动控制一致）
@@ -326,6 +328,8 @@ def ps2_loop(rover, ps2, data, serial):
                             
                             # ===== 阶段0：丢失巡游 =====
                             if dx == 999 and dy == 999:
+                                backup_mode = False
+                                backup_done = False
                                 print("🔍 目标丢失，巡游中...")
                                 row *= -1
                                 rover.servo_control.set_steering_angles(90.0, 90.0, 90.0, 90.0, 90.0, 90.0)
@@ -333,26 +337,43 @@ def ps2_loop(rover, ps2, data, serial):
                                 time.sleep(1)
                                 rover.stop()
                                 rover.servo_control.set_steering_angles(0, 0, 0, 0, 0, 0)
-                                
+
+                            # ===== 阶段0.5：后退模式（dy过小，持续后退直到dy<-10）=====
+                            elif backup_mode:
+                                if dy < -10:
+                                    backup_mode = False
+                                    backup_done = True
+                                    print("✅ 后退完成 dy={:.0f}, 恢复追踪".format(dy))
+                                else:
+                                    print("🔄 后退拉开 dy={:.0f}".format(dy))
+                                    rover.drive(speed_rad_s=-0.2, steer_angle_deg=0.0)
+
+                            # ===== 阶段0.6：进入后退模式（dy过小且未后退过）=====
+                            elif abs(dy) < 5 and abs(dx) > 10 and not backup_done:
+                                backup_mode = True
+                                print("🔄 dy过小({:.0f}), 进入后退模式".format(dy))
+                                rover.drive(speed_rad_s=-0.2, steer_angle_deg=0.0)
+
                             # ===== 终极平滑追踪：P控制 + 蟹行 =====
                             elif abs(dx) > 10 or abs(dy) > 10:
                                 angle = math.degrees(math.atan2(dx, -dy))
                                 distance = math.sqrt(dx**2 + dy**2)
                                 speed = distance * 0.002
-                                
+
                                 # 限速保护
                                 if speed > 0.4: speed = 0.4
                                 if speed < 0.15: speed = 0.15
-                                
+
                                 # dy>10 目标在下方（近）→ 后退；否则前进/蟹行
                                 if dy > 10:
                                     speed = -speed
                                     angle = -math.degrees(math.atan2(dx, dy))
-                                
+
                                 rover.drive(speed_rad_s=speed, steer_angle_deg=angle)
-                                
+
                             # ===== 阶段3：抓取 =====
                             elif abs(dx) <= 10 and abs(dy) <= 10:
+                                backup_done = False
                                 rover.stop()
                                 rover.center_chassis_servos()
                                 time.sleep_ms(300)

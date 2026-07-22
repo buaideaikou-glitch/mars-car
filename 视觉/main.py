@@ -512,7 +512,7 @@ def phase_detect_and_send():
         if app.need_exit():
             break
         img = cam_block.read()
-        img.draw_rectangle(0, 0, 640, 480, image.COLOR_BLACK, -1)
+        img.draw_rect(0, 0, 640, 480, image.COLOR_BLACK, -1)
         img.draw_string(180, 200, "所有任务完成!", image.COLOR_GREEN, 2.5)
         img.draw_string(200, 250, "系统已停止", image.COLOR_RED, 2)
         disp.show(img)
