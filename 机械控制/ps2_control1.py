@@ -387,7 +387,15 @@ def ps2_loop(rover, ps2, data, serial):
                                     )
                                     time.sleep_ms(_GRIPPER_SETTLE_MS)
 
-                                    # 4) 运动到放置姿态：7=-24.2, 9=0.0, 10=122.7, 11=0.4
+                                    # 4) 放置前过渡位姿：7=-19.9, 9=-0.1, 10=-140.9, 11=0
+                                    print("🦾 运动到放置前过渡位姿")
+                                    _move_arm_servos(
+                                        rover,
+                                        ((7, -19.9), (9, -0.1), (10, -140.9), (11, 0.0)),
+                                        speed_deg_s=_ARM_GRAB_SPEED,
+                                    )
+
+                                    # 5) 运动到放置姿态：7=-24.2, 9=0.0, 10=122.7, 11=0.4
                                     print("📦 运动到放置姿态")
                                     _move_arm_servos(
                                         rover,
