@@ -318,9 +318,11 @@ def ps2_loop(rover, ps2, data, serial):
                                 rover.stop()
                                 rover.servo_control.set_steering_angles(0, 0, 0, 0, 0, 0)
                                 
-                            # ===== 终极平滑追踪：P控制 + 蟹行 =====
+                            ## ===== 终极平滑追踪：P控制 + 蟹行 =====
                             elif abs(dx) > 10 or abs(dy) > 10:
-                                angle = math.degrees(math.atan2(dx, -dy))
+                                # 1. 统一计算目标绝对方位角 (-180 到 180度)
+                                # 车头正前为 0度，正右为 90度，正左为 -90度，正后方为 180度
+                                base_angle = math.degrees(math.atan2(dx, -dy))
                                 distance = math.sqrt(dx**2 + dy**2)
                                 speed = distance * 0.002
                                 
@@ -328,12 +330,26 @@ def ps2_loop(rover, ps2, data, serial):
                                 if speed > 0.4: speed = 0.4
                                 if speed < 0.15: speed = 0.15
                                 
-                                # dy>10 目标在下方（近）→ 后退；否则前进/蟹行
-                                if dy > 10:
+                                # 2. 防抽搐核心逻辑：加入侧向倒车缓冲死区
+                                if base_angle > 110:
+                                    # 目标在深右后方，改为向左打轮并倒车
+                                    steer = base_angle - 180
                                     speed = -speed
-                                    angle = -math.degrees(math.atan2(dx, dy))
+                                elif base_angle < -110:
+                                    # 目标在深左后方，改为向右打轮并倒车
+                                    steer = base_angle + 180
+                                    speed = -speed
+                                elif base_angle > 90:
+                                    # 目标在浅右后方，不倒车，钳位在最大角度纯横向蟹行
+                                    steer = 90.0
+                                elif base_angle < -90:
+                                    # 目标在浅左后方，不倒车，钳位在最大角度纯横向蟹行
+                                    steer = -90.0
+                                else:
+                                    # 目标在前方或正侧面，直接使用算出的角度
+                                    steer = base_angle
                                 
-                                rover.drive(speed_rad_s=speed, steer_angle_deg=angle)
+                                rover.drive(speed_rad_s=speed, steer_angle_deg=steer)
                                 
                             # ===== 阶段3：抓取 =====
                             elif abs(dx) <= 10 and abs(dy) <= 10:
