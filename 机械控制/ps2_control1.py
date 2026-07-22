@@ -1,0 +1,402 @@
+"""
+PS2 遥控业务控制逻辑。
+
+本文件负责把 PS2 按键和摇杆映射到底盘、相机和机械臂动作。
+ps2_lib.py 只负责手柄底层读取和安全接收。
+
+作者 王笑
+日期 20260528
+"""
+
+import math
+import time
+
+from arm_control import ArmKinematicsError
+from robot_config import (
+    MAX_MOTOR_RPM,
+    MAX_STEER_ANGLE_DEG,
+    PIVOT_SPEED_SCALE,
+    clamp,
+)
+
+_MAX_MOTOR_RAD_S = MAX_MOTOR_RPM * 2.0 * math.pi / 60.0
+_MAX_PIVOT_RAD_S = _MAX_MOTOR_RAD_S * PIVOT_SPEED_SCALE
+_ARM_JOG_COMMAND_DELAY_MS = 50
+_ARM_JOG_STEP_DEG = 8
+_last_arm_error_key = None
+_last_arm_error_ms = 0
+
+# ===== 抓取模式相关变量 =====
+grab_mode = False          # 是否处于抓取模式
+grab_cooldown = False      # 抓取冷却
+grab_cooldown_time = 0     # 冷却开始时间
+row = 1.5
+# ==============================================================================
+# 核心摇杆数据处理函数
+# ==============================================================================
+def map_joystick(raw_val, center=128, deadzone=12):
+    """
+    【摇杆数据映射核心】
+    将摇杆的原始 ADC 数据 (通常为 0-255) 转换为 -100 到 100 的百分比数值。
+    
+    参数说明:
+    - raw_val: 手柄底层读取到的原始摇杆数据 (0~255)
+    - center: 摇杆的物理中位值 (默认128)
+    - deadzone: 死区范围，摇杆在这个范围内的微小偏移会被忽略，防止摇杆回中不良导致漂移
+    """
+    # 1. 计算偏移量 (例如 128 - 128 = 0; 255 - 128 = 127)
+    offset = int(raw_val) - center
+    
+    # 2. 死区过滤：如果偏移量在死区范围内，说明没有有效拨动，直接返回 0
+    if abs(offset) <= deadzone:
+        return 0
+        
+    # 3. 确定方向：正向推为 1，反向拉为 -1
+    sign = 1 if offset > 0 else -1
+    
+    # 4. 计算有效活动区间 (127 - 12 = 115)
+    active_range = 127.0 - deadzone
+    
+    # 5. 扣除死区后，将实际偏移量映射到 0~100 的百分比，并附加上方向符号
+    mapped = int(((abs(offset) - deadzone) / active_range) * 100.0) * sign
+    
+    # 6. 安全限制：确保最终输出严格在 -100 到 100 之间
+    return clamp(mapped, -100, 100)
+
+
+def small_motion(value, threshold):
+    # 过滤微小动作，如果计算出的运动增量小于设定阈值，则直接归零
+    return 0.0 if abs(value) < threshold else value
+
+
+def button_pressed(data, btn):
+    # 通过位与运算判断底层传来的复合数据中，某个特定按键是否被按下
+    return (data & btn) == btn
+
+
+def ticks_ms():
+    if hasattr(time, "ticks_ms"):
+        return time.ticks_ms()
+    return int(time.time() * 1000)
+
+
+def ticks_diff(a, b):
+    if hasattr(time, "ticks_diff"):
+        return time.ticks_diff(a, b)
+    return a - b
+
+
+def print_arm_error(err):
+    # 打印机械臂错误，并进行防刷屏处理（1秒内相同的错误只报一次）
+    global _last_arm_error_key, _last_arm_error_ms
+    now_ms = ticks_ms()
+    key = (err.reason, err.message)
+    if key == _last_arm_error_key and ticks_diff(now_ms, _last_arm_error_ms) < 1000:
+        return
+    _last_arm_error_key = key
+    _last_arm_error_ms = now_ms
+    print("机械臂目标无效：%s，%s" % (err.reason, err.message))
+
+
+def sync_arm_control_state(rover):
+    if rover.arm is None:
+        return True
+    try:
+        rover.arm.sync_from_servos()
+        rover.arm.sync_camera_from_servo()
+    except ArmKinematicsError as err:
+        print_arm_error(err)
+        return False
+    return True
+
+# ==============================================================================
+# 机械臂控制模式（处理传进来的摇杆数据）
+# ==============================================================================
+def handle_arm_control(rover, ps2, buttons, lx, ly, rx, ry):
+    if rover.arm is None:
+        return
+
+    # 【L1 键】松开夹爪（0°），【R1 键】夹紧夹爪（65°）
+    if button_pressed(buttons, ps2.PS2_BTN_L1):
+        rover.arm.servo_control.set_reserve_servo_angle(15, 0.0, speed_deg_s=60.0)
+        time.sleep_ms(_ARM_JOG_COMMAND_DELAY_MS)
+        return
+    if button_pressed(buttons, ps2.PS2_BTN_R1):
+        rover.arm.servo_control.set_reserve_servo_angle(15, 65.0, speed_deg_s=60.0)
+        time.sleep_ms(_ARM_JOG_COMMAND_DELAY_MS)
+        return
+
+    # 【O 键】复位机械臂及相机角度
+    if button_pressed(buttons, ps2.PS2_BTN_CIRCLE):
+        try:
+            rover.arm.apply_initial_pose()
+        except ArmKinematicsError as err:
+            print_arm_error(err)
+        try:
+            rover.arm.jog_camera(-rover.arm.camera_angle_deg)
+        except ArmKinematicsError as err:
+            print_arm_error(err)
+        return
+
+    # 【十字键 左右】微调相机角度
+    if button_pressed(buttons, ps2.PS2_BTN_LEFT):
+        try:
+            rover.arm.jog_camera(_ARM_JOG_STEP_DEG)
+        except ArmKinematicsError as err:
+            print_arm_error(err)
+    if button_pressed(buttons, ps2.PS2_BTN_RIGHT):
+        try:
+            rover.arm.jog_camera(-_ARM_JOG_STEP_DEG)
+        except ArmKinematicsError as err:
+            print_arm_error(err)
+
+    # 【摇杆数据读取与映射 - 机械臂模式】
+    # 机械臂模式的死区设为 20（比底盘严格），避免从底盘切换时发生误碰
+    left_y = map_joystick(ly, deadzone=20)
+    # 取反适配机械臂 Roll 轴坐标系
+    right_x = -map_joystick(rx, deadzone=20) 
+    right_y = map_joystick(ry, deadzone=20)
+
+    roll_delta = 0.0
+    pitch1_delta = 0.0
+    pitch2_delta = 0.0
+    pitch3_delta = 0.0
+
+    # 【将百分比 (-100~100) 转化为角度增量】
+    # / 100.0 将其变为 -1.0 到 1.0 的比例系数，再乘以最大步进角度
+    if right_x != 0:
+        roll_delta = right_x / 100.0 * _ARM_JOG_STEP_DEG
+    if right_y != 0:
+        pitch1_delta = right_y / 100.0 * _ARM_JOG_STEP_DEG
+    if left_y != 0:
+        pitch2_delta = left_y / 100.0 * _ARM_JOG_STEP_DEG
+        
+    # 【十字键 上下】按照固定步进修改 Pitch3
+    if button_pressed(buttons, ps2.PS2_BTN_UP):
+        pitch3_delta += _ARM_JOG_STEP_DEG
+    if button_pressed(buttons, ps2.PS2_BTN_DOWN):
+        pitch3_delta -= _ARM_JOG_STEP_DEG
+
+    # 使用 small_motion 过滤掉极微小变化 (小于 0.5度的杂波)
+    roll_delta = small_motion(roll_delta, 0.5)
+    pitch1_delta = small_motion(pitch1_delta, 0.5)
+    pitch2_delta = small_motion(pitch2_delta, 0.5)
+    pitch3_delta = small_motion(pitch3_delta, 0.5)
+
+    if (roll_delta != 0.0 or pitch1_delta != 0.0 or
+            pitch2_delta != 0.0 or pitch3_delta != 0.0):
+        try:
+            rover.arm.jog_joints(
+                roll_delta,
+                pitch1_delta,
+                pitch2_delta,
+                pitch3_delta,
+            )
+        except ArmKinematicsError as err:
+            print_arm_error(err)
+
+# ==============================================================================
+# 主循环控制：演示如何从底层获取摇杆信息
+# ==============================================================================
+def ps2_loop(rover, ps2, data, serial):
+    global grab_mode, grab_cooldown, grab_cooldown_time
+    
+    print("PS2 控制：X失能，三角使能，R1停车，R2+右摇杆左右原地转向，L2+O机械臂回初始位并相机回0，L2+方向键左右控制相机，上下控制Pitch3，L2+左摇杆前后控制Pitch2，右摇杆前后控制Pitch1，右摇杆左右控制Roll。")
+    print("方框键：切换自动抓取模式")
+    arm_mode_active = False
+    
+    while True:
+        # 【第一步：触发底层更新】要求底层库发起一次 SPI 通信，读取手柄当前状态
+        ps2.update()
+        #print(f"🔍 调试：data['value'] = {data['value']}")
+        # ===== 处理摄像头数据（抓取模式） =====
+        
+        # 【第二步：获取摇杆信息的关键快照】
+        fresh, buttons, lx, ly, rx, ry, _ = ps2.snapshot()
+        
+        # 如果获取数据失败 (手柄断开或通讯异常)，停止动作并重新尝试获取
+        if not fresh:
+            rover.stop()
+            arm_mode_active = False
+            continue
+
+        # 【SELECT 键】退出PS2控制
+        if button_pressed(buttons, ps2.PS2_BTN_SELECT):
+            rover.stop()
+            print("SELECT：退出 PS2 控制。")
+            break
+
+        # 【方框键】切换抓取模式
+        if button_pressed(buttons, ps2.PS2_BTN_SQUARE):
+            grab_mode = not grab_mode
+            if grab_mode:
+                print("🎯 方框键按下，进入抓取模式")
+                rover.stop()
+                grab_cooldown = False
+                grab_cooldown_time = 0
+            else:
+                print("⏹️ 退出抓取模式")
+                rover.stop()
+            time.sleep_ms(200)  # 防抖
+            continue
+        
+        # ==========================================================
+        # 抓取模式的自动逻辑
+        # ==========================================================
+        if grab_mode:
+            if grab_cooldown:
+                if time.time() - grab_cooldown_time < 1.0:
+                    pass
+                else:
+                    grab_cooldown = False
+                    print("🔄 冷却结束")
+            
+            if not grab_cooldown:
+                serial_data = data["value"]
+                if serial_data is not None:
+                    data["value"] = None
+                    parts = serial_data.strip().split()
+                    if len(parts) == 2:
+                        try:
+                            dx = int(parts[0])
+                            dy = int(parts[1])
+                            
+                            # ===== 阶段0：丢失巡游 =====
+                            if dx == 999 and dy == 999:
+                                print("🔍 目标丢失，巡游中...")
+                                row *= -1
+                                rover.servo_control.set_steering_angles(90.0, 90.0, 90.0, 90.0, 90.0, 90.0)
+                                rover.drive(speed_rad_s= row+0.5, steer_angle_deg=0.0)
+                                time.sleep(1)
+                                rover.stop()
+                                rover.servo_control.set_steering_angles(0, 0, 0, 0, 0, 0)
+                                
+                            # ===== 终极平滑追踪：P控制 + 蟹行 =====
+                            elif abs(dx) > 10 or abs(dy) > 10:
+                                angle = math.degrees(math.atan2(dx, -dy))
+                                distance = math.sqrt(dx**2 + dy**2)
+                                speed = distance * 0.002
+                                
+                                # 限速保护
+                                if speed > 0.4: speed = 0.4
+                                if speed < 0.15: speed = 0.15
+                                
+                                # dy>10 目标在下方（近）→ 后退；否则前进/蟹行
+                                if dy > 10:
+                                    speed = -speed
+                                    angle = -math.degrees(math.atan2(dx, dy))
+                                
+                                rover.drive(speed_rad_s=speed, steer_angle_deg=angle)
+                                
+                            # ===== 阶段3：抓取 =====
+                            elif abs(dx) <= 10 and abs(dy) <= 10:
+                                rover.stop()
+                                rover.center_chassis_servos()
+                                time.sleep_ms(300)
+                                rover.stop()
+                                print("✋ 目标已对准，开始抓取！")
+                                
+                                # 保存当前相机角度，张至最大（0°），为机械臂腾出空间
+                                saved_cam_angle = 0.0
+                                if rover.arm is not None:
+                                    saved_cam_angle = rover.arm.camera_angle_deg
+                                    try:
+                                        rover.arm.jog_camera(-saved_cam_angle)
+                                    except ArmKinematicsError as err:
+                                        print_arm_error(err)
+                                    time.sleep_ms(500)
+                                
+                                # 机械臂抓取放置
+                                pick_angles = (0, 30, 30, 0)
+                                place_angles = (0, -30, -30, 0)
+                                if rover.arm is not None:
+                                    rover.arm.pick_and_place(
+                                        pick_angles=pick_angles, place_angles=place_angles,
+                                        gripper_id=15, gripper_open_deg=30.0, gripper_close_deg=-30.0,
+                                        arm_speed=60.0, gripper_speed=60.0
+                                    )
+                                
+                                # 机械臂复位
+                                if rover.arm is not None:
+                                    try:
+                                        rover.arm.apply_initial_pose()
+                                    except ArmKinematicsError as err:
+                                        print_arm_error(err)
+                                    time.sleep_ms(500)
+                                    
+                                    # 相机恢复到追踪时的角度
+                                    try:
+                                        rover.arm.jog_camera(saved_cam_angle - rover.arm.camera_angle_deg)
+                                    except ArmKinematicsError as err:
+                                        print_arm_error(err)
+                                
+                                print("✅ 抓取放置完成！")
+                                serial.write(b"ok\n")
+                                
+                                grab_cooldown = True
+                                grab_cooldown_time = time.time()
+                                
+                        except Exception as e:
+                            pass
+            
+            # 👇 核心救命代码：强制每次循环休息 30 毫秒，防止手柄通讯崩溃！
+            time.sleep_ms(30)
+            
+            # 只要是抓取模式，处理完就从头开始，跳过下面的手动控制
+            continue
+        
+        # 【L2 键】按住时进入机械臂模式（放在R1之前，以便L2+R1控制夹爪）
+        if button_pressed(buttons, ps2.PS2_BTN_L2):
+            if not arm_mode_active:
+                rover.stop()
+                if not sync_arm_control_state(rover):
+                    time.sleep_ms(_ARM_JOG_COMMAND_DELAY_MS)
+                    continue
+                arm_mode_active = True
+            handle_arm_control(rover, ps2, buttons, lx, ly, rx, ry)
+            time.sleep_ms(_ARM_JOG_COMMAND_DELAY_MS)
+            continue
+
+        # 【R1 键】紧急停止
+        if button_pressed(buttons, ps2.PS2_BTN_R1):
+            rover.stop()
+            arm_mode_active = False
+            time.sleep_ms(100)
+            continue
+
+        # 【CROSS 键】电机失能
+        if button_pressed(buttons, ps2.PS2_BTN_CROSS):
+            rover.disable()
+            arm_mode_active = False
+            time.sleep_ms(200)
+            continue
+
+        # 【TRIANGLE 键】电机使能
+        if button_pressed(buttons, ps2.PS2_BTN_TRIANGLE):
+            rover.enable_motors()
+            arm_mode_active = False
+            time.sleep_ms(200)
+            continue
+
+        arm_mode_active = False
+        
+        # 【R2 键】按住时，将右摇杆信息分配给底盘进行原地转向
+        if button_pressed(buttons, ps2.PS2_BTN_R2):
+            turn = map_joystick(rx)
+            turn_speed = turn / 100.0 * _MAX_PIVOT_RAD_S
+            rover.pivot_turn(turn_speed)
+            time.sleep_ms(50)
+            continue
+
+        # 【常规底盘行驶】
+        # ry (右摇杆Y轴) 作为油门
+        throttle = -map_joystick(ry)
+        # lx (左摇杆X轴) 作为转向舵
+        steer = map_joystick(lx)
+        
+        speed_rad_s = throttle / 100.0 * _MAX_MOTOR_RAD_S
+        steer_angle_deg = steer / 100.0 * MAX_STEER_ANGLE_DEG
+        
+        rover.drive(speed_rad_s, steer_angle_deg)
+        time.sleep_ms(50)
+
