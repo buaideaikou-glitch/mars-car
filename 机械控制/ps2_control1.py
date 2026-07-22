@@ -355,7 +355,21 @@ def ps2_loop(rover, ps2, data, serial):
                                 
                                 # 机械臂抓取放置（固定原始舵机角度，与 START 打印一致）
                                 if rover.arm is not None:
-                                    # 1) 运动到抓取姿态：7=-59.2, 9=0, 10=-116.7, 11=0.1
+                                    # 1) 过渡位姿 1：7=-19.9, 9=-0.1, 10=-140.9, 11=0
+                                    print("🦾 运动到过渡位姿 1")
+                                    _move_arm_servos(
+                                        rover,
+                                        ((7, -19.9), (9, -0.1), (10, -140.9), (11, 0.0)),
+                                        speed_deg_s=_ARM_GRAB_SPEED,
+                                    )
+                                    # 2) 过渡位姿 2：7=-36.8, 9=-1.7, 10=-131.2, 11=0
+                                    print("🦾 运动到过渡位姿 2")
+                                    _move_arm_servos(
+                                        rover,
+                                        ((7, -36.8), (9, -1.7), (10, -131.2), (11, 0.0)),
+                                        speed_deg_s=_ARM_GRAB_SPEED,
+                                    )
+                                    # 3) 运动到抓取姿态：7=-59.2, 9=0, 10=-116.7, 11=0.1
                                     print("🦾 运动到抓取姿态")
                                     _move_arm_servos(
                                         rover,
@@ -368,7 +382,7 @@ def ps2_loop(rover, ps2, data, serial):
                                     )
                                     time.sleep_ms(_GRIPPER_SETTLE_MS)
 
-                                    # 2) 运动到放置姿态：7=-24.2, 9=0.0, 10=122.7, 11=0.4
+                                    # 4) 运动到放置姿态：7=-24.2, 9=0.0, 10=122.7, 11=0.4
                                     print("📦 运动到放置姿态")
                                     _move_arm_servos(
                                         rover,
