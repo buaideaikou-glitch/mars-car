@@ -203,6 +203,7 @@ def ps2_loop(rover, ps2, data, serial):
     
     print("PS2 控制：X失能，三角使能，R1停车，R2+右摇杆左右原地转向，L2+O机械臂回初始位并相机回0，L2+方向键左右控制相机，上下控制Pitch3，L2+左摇杆前后控制Pitch2，右摇杆前后控制Pitch1，右摇杆左右控制Roll。")
     print("方框键：切换自动抓取模式")
+    print("START键：打印 12/13/14/15 号舵机当前角度")
     arm_mode_active = False
     
     while True:
@@ -225,6 +226,20 @@ def ps2_loop(rover, ps2, data, serial):
             rover.stop()
             print("SELECT：退出 PS2 控制。")
             break
+
+        # 【START 键】打印 12/13/14/15 号舵机当前角度
+        # 走底层 servo_bus.read_angles 一次性查询（不看 robot_config 登记，没接的 ID 显示无响应）
+        if button_pressed(buttons, ps2.PS2_BTN_START):
+            result = dict(rover.servo_control.servo_bus.read_angles((12, 13, 14, 15)))
+            print("===== 舵机角度查询 =====")
+            for _sid in (12, 13, 14, 15):
+                _ang = result.get(_sid)
+                if _ang is None:
+                    print("  舵机 %d: 无响应" % _sid)
+                else:
+                    print("  舵机 %d: %.1f°" % (_sid, _ang))
+            time.sleep_ms(300)  # 防抖，避免按住时刷屏
+            continue
 
         # 【方框键】切换抓取模式
         if button_pressed(buttons, ps2.PS2_BTN_SQUARE):
