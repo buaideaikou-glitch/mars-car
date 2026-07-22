@@ -126,7 +126,7 @@ def handle_arm_control(rover, ps2, buttons, lx, ly, rx, ry):
         time.sleep_ms(_ARM_JOG_COMMAND_DELAY_MS)
         return
 
-    # 【O 键】复位机械臂及相机角度
+    # 【O 键】复位机械臂、相机角度及预留舵机
     if button_pressed(buttons, ps2.PS2_BTN_CIRCLE):
         try:
             rover.arm.apply_initial_pose()
@@ -136,6 +136,10 @@ def handle_arm_control(rover, ps2, buttons, lx, ly, rx, ry):
             rover.arm.jog_camera(-rover.arm.camera_angle_deg)
         except ArmKinematicsError as err:
             print_arm_error(err)
+        try:
+            rover.servo_control.init_reserve_servos()
+        except Exception as err:
+            print("预留舵机复位失败：", err)
         return
 
     # 【十字键 左右】微调相机角度
