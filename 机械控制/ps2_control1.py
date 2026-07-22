@@ -286,6 +286,7 @@ def ps2_loop(rover, ps2, data, serial):
                 rover.stop()
                 grab_cooldown = False
                 grab_cooldown_time = 0
+                data["value"] = None  # 清除残留的finish信号
             else:
                 print("⏹️ 退出抓取模式")
                 rover.stop()
@@ -296,6 +297,16 @@ def ps2_loop(rover, ps2, data, serial):
         # 抓取模式的自动逻辑
         # ==========================================================
         if grab_mode:
+            # 检查finish信号（任何时候都响应，包括冷却期间）
+            camera_val = data["value"]
+            if camera_val is not None and camera_val == "finish":
+                data["value"] = None
+                print("📢 收到finish，自动退出抓取模式")
+                grab_mode = False
+                grab_cooldown = False
+                rover.stop()
+                continue
+
             if grab_cooldown:
                 if time.time() - grab_cooldown_time < 1.0:
                     pass
@@ -425,7 +436,12 @@ def ps2_loop(rover, ps2, data, serial):
                                     
                                     # 相机恢复到追踪时的角度
                                     try:
-                                        rover.arm.jog_camera(saved_cam_angle - rover.arm.camera_angle_deg)
+                                        rover.arm.sync_camera_from_servo()
+                                        delta = saved_cam_angle - rover.arm.camera_angle_deg
+                                        print("📷 恢复相机: 当前{:.1f}° → 目标{:.1f}° (delta={:.1f}°)".format(
+                                            rover.arm.camera_angle_deg, saved_cam_angle, delta))
+                                        rover.arm.jog_camera(delta)
+                                        time.sleep_ms(500)
                                     except ArmKinematicsError as err:
                                         print_arm_error(err)
                                 

@@ -14,7 +14,6 @@
 """
 import time, _thread, sys, machine
 time.sleep(3)
-
 from machine import UART
 from esp32 import CAN
 from ps2_lib import PS2Controller, PS2Receiver
@@ -100,7 +99,7 @@ def re_uart(uart):
                 data= uart.readline()
                 if data:
                     camera_data["value"] = data.decode("utf-8", "replace").strip()
-                    #print("串口1收到数据:", camera_data)
+                    print("串口1收到数据:", camera_data)
             time.sleep_ms(10)       # 防止形成阻塞              
     except UnicodeError:
         print("【成功拦截乱码】串口1收到一串无法识别的非文本数据:")

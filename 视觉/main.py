@@ -77,7 +77,6 @@ color_draw = {
 }
 
 # ============ 初始化 ============
-cam_qr = camera.Camera(320, 240)
 cam_block = camera.Camera(640, 480)
 disp = display.Display()
 
@@ -192,7 +191,7 @@ def phase_qr_scan():
     print("="*50)
     
     while not task_parsed and not app.need_exit():
-        img = cam_qr.read()
+        img = cam_block.read()
         qrcodes = img.find_qrcodes()
         
         for qr in qrcodes:
@@ -500,7 +499,11 @@ def phase_detect_and_send():
     print("\\n" + "="*50)
     print("[TASK_COMPLETE] 所有任务完成")
     print("="*50)
-    
+
+    # 通知ESP32所有任务完成，自动退出抓取模式
+    serial.write_str("finish\n")
+    print("[UART TX] 发送finish → ESP32退出抓取模式")
+
     system_active = False
     waiting_ok = False
     current_color = None
