@@ -31,6 +31,34 @@ grab_mode = False          # 是否处于抓取模式
 grab_cooldown = False      # 抓取冷却
 grab_cooldown_time = 0     # 冷却开始时间
 row = 1.5
+
+# 抓取/放置过程中使用的固定参数
+_GRIPPER_SERVO_ID = 15       # 夹爪舵机 ID（与 L1/R1 手动控制一致）
+_GRIPPER_OPEN_DEG = 0.0      # 夹爪松开角度（对应 L1）
+_GRIPPER_CLOSE_DEG = 65.0    # 夹爪夹紧角度（对应 R1）
+_ARM_GRAB_SPEED = 60.0       # 抓取过程中机械臂运动速度 (deg/s)
+_GRIPPER_SETTLE_MS = 1200    # 夹爪动作后的等待时间
+_ARM_SERVO_IDS = (7, 9, 10, 11)  # 机械臂四个关节舵机 ID
+
+
+def _move_arm_servos(rover, targets, speed_deg_s=_ARM_GRAB_SPEED, extra_ms=400):
+    """
+    按原始舵机角度（与 START 打印一致）驱动 7/9/10/11 号机械臂舵机，
+    并按「最大角差 / 速度」估算等待时间，确保到位后再返回。
+    targets: ((servo_id, angle_deg), ...) 形式的原始舵机角度。
+    """
+    bus = rover.servo_control.servo_bus
+    current = dict(bus.read_angles(_ARM_SERVO_IDS))
+    max_delta = 0.0
+    for servo_id, angle_deg in targets:
+        cur = current.get(servo_id)
+        if cur is not None:
+            max_delta = max(max_delta, abs(float(angle_deg) - float(cur)))
+    bus.set_angles(targets, speed_deg_s=speed_deg_s)
+    wait_ms = int(max_delta / max(float(speed_deg_s), 1.0) * 1000) + int(extra_ms)
+    time.sleep_ms(wait_ms)
+
+
 # ==============================================================================
 # 核心摇杆数据处理函数
 # ==============================================================================
@@ -206,7 +234,7 @@ def ps2_loop(rover, ps2, data, serial):
     global grab_mode, grab_cooldown, grab_cooldown_time
     
     print("PS2 控制：X失能，三角使能，R1停车，R2+右摇杆左右原地转向，L2+O机械臂回初始位并相机回0，L2+方向键左右控制相机，上下控制Pitch3，L2+左摇杆前后控制Pitch2，右摇杆前后控制Pitch1，右摇杆左右控制Roll。")
-    print("方框键：切换自动抓取模式")
+    print("L2+三角键：切换自动抓取模式（对准后自动 抓取→放置→复位）")
     print("START键：打印 7/9/10/11/14 号舵机当前角度")
     arm_mode_active = False
     
@@ -245,11 +273,11 @@ def ps2_loop(rover, ps2, data, serial):
             time.sleep_ms(300)  # 防抖，避免按住时刷屏
             continue
 
-        # 【方框键】切换抓取模式
-        if button_pressed(buttons, ps2.PS2_BTN_SQUARE):
+        # 【L2 + 三角键】切换抓取模式（放在 grab_mode 与 L2 机械臂模式之前，确保可随时进入/退出）
+        if button_pressed(buttons, ps2.PS2_BTN_L2) and button_pressed(buttons, ps2.PS2_BTN_TRIANGLE):
             grab_mode = not grab_mode
             if grab_mode:
-                print("🎯 方框键按下，进入抓取模式")
+                print("🎯 L2+三角键按下，进入抓取模式")
                 rover.stop()
                 grab_cooldown = False
                 grab_cooldown_time = 0
@@ -325,23 +353,56 @@ def ps2_loop(rover, ps2, data, serial):
                                         print_arm_error(err)
                                     time.sleep_ms(500)
                                 
-                                # 机械臂抓取放置
-                                pick_angles = (0, 30, 30, 0)
-                                place_angles = (0, -30, -30, 0)
+                                # 机械臂抓取放置（固定原始舵机角度，与 START 打印一致）
                                 if rover.arm is not None:
-                                    rover.arm.pick_and_place(
-                                        pick_angles=pick_angles, place_angles=place_angles,
-                                        gripper_id=15, gripper_open_deg=30.0, gripper_close_deg=-30.0,
-                                        arm_speed=60.0, gripper_speed=60.0
+                                    # 1) 运动到抓取姿态：7=-59.2, 9=0, 10=-116.7, 11=0.1
+                                    print("🦾 运动到抓取姿态")
+                                    _move_arm_servos(
+                                        rover,
+                                        ((7, -59.2), (9, 0.0), (10, -116.7), (11, 0.1)),
+                                        speed_deg_s=_ARM_GRAB_SPEED,
                                     )
+                                    # 夹爪保持夹紧
+                                    rover.servo_control.set_reserve_servo_angle(
+                                        _GRIPPER_SERVO_ID, _GRIPPER_CLOSE_DEG, speed_deg_s=60.0
+                                    )
+                                    time.sleep_ms(_GRIPPER_SETTLE_MS)
+
+                                    # 2) 运动到放置姿态：7=-24.2, 9=0.0, 10=122.7, 11=0.4
+                                    print("📦 运动到放置姿态")
+                                    _move_arm_servos(
+                                        rover,
+                                        ((7, -24.2), (9, 0.0), (10, 122.7), (11, 0.4)),
+                                        speed_deg_s=_ARM_GRAB_SPEED,
+                                    )
+                                    # 夹爪松开
+                                    rover.servo_control.set_reserve_servo_angle(
+                                        _GRIPPER_SERVO_ID, _GRIPPER_OPEN_DEG, speed_deg_s=60.0
+                                    )
+                                    time.sleep_ms(_GRIPPER_SETTLE_MS)
                                 
                                 # 机械臂复位
                                 if rover.arm is not None:
+                                    _pre_reset = dict(
+                                        rover.servo_control.servo_bus.read_angles(_ARM_SERVO_IDS)
+                                    )
                                     try:
                                         rover.arm.apply_initial_pose()
                                     except ArmKinematicsError as err:
                                         print_arm_error(err)
-                                    time.sleep_ms(500)
+                                    # 初始位对应的原始舵机角度（与 robot_config 的 ARM_INIT_* 对应：
+                                    # 7=PITCH1=50, 9=ROLL=0, 10=PITCH2=-140, 11=PITCH3=0）
+                                    _reset_max_delta = 0.0
+                                    for _sid, _tgt in ((7, 50.0), (9, 0.0), (10, -140.0), (11, 0.0)):
+                                        _cur = _pre_reset.get(_sid)
+                                        if _cur is not None:
+                                            _reset_max_delta = max(_reset_max_delta, abs(_tgt - float(_cur)))
+                                    time.sleep_ms(int(_reset_max_delta / _ARM_GRAB_SPEED * 1000) + 400)
+                                    try:
+                                        rover.servo_control.init_reserve_servos()
+                                    except Exception as err:
+                                        print("预留舵机复位失败：", err)
+                                    time.sleep_ms(_GRIPPER_SETTLE_MS)
                                     
                                     # 相机恢复到追踪时的角度
                                     try:
