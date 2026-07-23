@@ -35,6 +35,11 @@ grabbed_block_pos = None
 waiting_ok = False            # 对准后等待小车ok
 car_grab_ok = False           # 收到ok
 
+# 抓取后冷却（视觉端），防止摄像头归位后立即重新识别触发二次抓取
+grab_cooldown = False
+grab_cooldown_time = 0.0
+GRAB_COOLDOWN_SEC = 2.0       # 冷却时间，需大于小车端1秒冷却
+
 # 锁定丢失容忍度
 LOCK_LOST_TOLERANCE = 10
 lock_lost_count = 0
@@ -335,6 +340,7 @@ def phase_detect_and_send():
     global current_color, remaining_count, grab_count, system_active
     global locked_block, align_count, lock_lost_count, waiting_ok, car_grab_ok, ok_wait_start
     global grabbed_positions, grabbed_block_pos
+    global grab_cooldown, grab_cooldown_time
     
     cn_names = {"red": "红色", "blue": "蓝色", "yellow": "黄色", "purple": "紫色", "pink": "粉色"}
     
@@ -360,6 +366,7 @@ def phase_detect_and_send():
         waiting_ok = False
         car_grab_ok = False
         ok_wait_start = 0.0
+        grab_cooldown = False
         grabbed_positions.clear()
         
         color_cn = cn_names.get(color_en, color_en)
@@ -369,6 +376,19 @@ def phase_detect_and_send():
         
         while grab_count < remaining_count and not app.need_exit():
             img = cam_block.read()
+            
+            # ====== 抓取后冷却，防止摄像头归位后立即重新识别 ======
+            if grab_cooldown:
+                if time.time() - grab_cooldown_time < GRAB_COOLDOWN_SEC:
+                    draw_ui(img, None, color_en, grab_count, remaining_count,
+                           False, align_count, lock_lost_count)
+                    img.draw_string(10, 65, "⏳ 抓取冷却中...", image.COLOR_YELLOW, 1.5)
+                    disp.show(img)
+                    time.sleep(0.05)
+                    continue
+                else:
+                    grab_cooldown = False
+                    print("[COOLDOWN] 冷却结束，恢复识别")
             
             # ====== 收到ok，抓取完成 ======
             if car_grab_ok:
@@ -388,6 +408,11 @@ def phase_detect_and_send():
                     print(f"[DONE] {color_cn} 全部完成!")
                     time.sleep(0.5)
                     break
+                
+                # 启动冷却，等待摄像头归位稳定
+                grab_cooldown = True
+                grab_cooldown_time = time.time()
+                print(f"[COOLDOWN] 启动{GRAB_COOLDOWN_SEC}秒冷却，等待摄像头归位稳定")
                 
                 print(f"[NEXT] 准备下一块 ({grab_count}/{remaining_count})")
                 time.sleep(0.3)
@@ -515,6 +540,7 @@ while not app.need_exit():
     system_active = False
     waiting_ok = False
     car_grab_ok = False
+    grab_cooldown = False
     
     phase_qr_scan()
     

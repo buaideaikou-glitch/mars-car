@@ -327,10 +327,12 @@ def ps2_loop(rover, ps2, data, serial):
                 continue
 
             if grab_cooldown:
-                if time.time() - grab_cooldown_time < 1.0:
-                    pass
+                if time.time() - grab_cooldown_time < 2.0:
+                    # 冷却期间持续清空串口数据，防止摄像头归位过程中的残影/误识别数据被处理
+                    data["value"] = None
                 else:
                     grab_cooldown = False
+                    data["value"] = None
                     print("🔄 冷却结束")
             
             if not grab_cooldown:
