@@ -61,6 +61,18 @@ def _move_arm_servos(rover, targets, speed_deg_s=_ARM_GRAB_SPEED, extra_ms=400):
     time.sleep_ms(wait_ms)
 
 
+def _flush_camera_uart(serial, max_ms=100):
+    """排空 camera_uart 接收 FIFO 中的残留字节（旧颜色偏移），避免被抓取逻辑当成新目标。"""
+    try:
+        deadline = ticks_ms() + max_ms
+        while serial.any():
+            serial.read(serial.any())
+            if ticks_ms() > deadline:
+                break
+    except Exception:
+        pass
+
+
 # ==============================================================================
 # 核心摇杆数据处理函数
 # ==============================================================================
@@ -238,7 +250,7 @@ def handle_arm_control(rover, ps2, buttons, lx, ly, rx, ry):
 # 主循环控制：演示如何从底层获取摇杆信息
 # ==============================================================================
 def ps2_loop(rover, ps2, data, serial):
-    global grab_mode, grab_cooldown, grab_cooldown_time
+    global grab_mode, grab_cooldown, grab_cooldown_time, _awaiting_new_target
     
     print("PS2 控制：X失能，三角使能，R1停车，R2+右摇杆左右原地转向，L2+O机械臂回初始位并相机回0，L2+方向键左右控制相机，上下控制Pitch3，L2+左摇杆前后控制Pitch2，右摇杆前后控制Pitch1，右摇杆左右控制Roll。")
     print("方框键：切换自动抓取模式")
@@ -288,6 +300,7 @@ def ps2_loop(rover, ps2, data, serial):
                 rover.stop()
                 grab_cooldown = False
                 grab_cooldown_time = 0
+                _awaiting_new_target = False  # 首次抓取按正常流程进行
                 data["value"] = None  # 清除残留的finish信号
             else:
                 print("⏹️ 退出抓取模式")
@@ -326,6 +339,9 @@ def ps2_loop(rover, ps2, data, serial):
                             dx = int(parts[0])
                             dy = int(parts[1])
                             
+                            # ===== 闸门：刚发完 ok，正在等新目标的真实追踪帧；旧颜色残留的"0 0"先忽略 =====
+                            if _awaiting_new_target and abs(dx) <= 10 and abs(dy) <= 10:
+                                print("⏸️ 等待新目标追踪信号，忽略疑似旧颜色残留的 0,0")
                             # ===== 阶段0：丢失巡游 =====
                             if dx == 999 and dy == 999:
                                 backup_mode = False
@@ -356,6 +372,7 @@ def ps2_loop(rover, ps2, data, serial):
 
                             # ===== 终极平滑追踪：P控制 + 蟹行 =====
                             elif abs(dx) > 10 or abs(dy) > 10:
+                                _awaiting_new_target = False  # 收到真实追踪帧，解除闸门
                                 angle = math.degrees(math.atan2(dx, -dy))
                                 distance = math.sqrt(dx**2 + dy**2)
                                 speed = distance * 0.002
@@ -406,11 +423,11 @@ def ps2_loop(rover, ps2, data, serial):
                                         ((7, -36.8), (9, -1.7), (10, -131.2), (11, 0.0)),
                                         speed_deg_s=_ARM_GRAB_SPEED,
                                     )
-                                    # 3) 运动到抓取姿态：7=-59.2, 9=0, 10=-116.7, 11=0.1
+                                    # 3) 运动到抓取姿态：7=-59.2, 9=0, 10=-116.7, 11=-5
                                     print("🦾 运动到抓取姿态")
                                     _move_arm_servos(
                                         rover,
-                                        ((7, -59.2), (9, 0.0), (10, -116.7), (11, 0.1)),
+                                        ((7, -59.2), (9, 0.0), (10, -116.7), (11, -5)),
                                         speed_deg_s=_ARM_GRAB_SPEED,
                                     )
                                     # 夹爪保持夹紧
@@ -427,11 +444,11 @@ def ps2_loop(rover, ps2, data, serial):
                                         speed_deg_s=_ARM_GRAB_SPEED,
                                     )
 
-                                    # 5) 运动到放置姿态：7=-24.2, 9=0.0, 10=122.7, 11=0.4
+                                    # 5) 运动到放置姿态：7=-24.2, 9=0.0, 10=120.7, 11=0.4
                                     print("📦 运动到放置姿态")
                                     _move_arm_servos(
                                         rover,
-                                        ((7, -24.2), (9, 0.0), (10, 122.7), (11, 0.4)),
+                                        ((7, -24.2), (9, 0.0), (10, 120.7), (11, 0.4)),
                                         speed_deg_s=_ARM_GRAB_SPEED,
                                     )
                                     # 夹爪松开
@@ -476,7 +493,12 @@ def ps2_loop(rover, ps2, data, serial):
                                 
                                 print("✅ 抓取放置完成！")
                                 serial.write(b"ok\n")
-                                
+
+                                # 丢弃旧颜色残留：清空接收 FIFO + 清除缓存，避免把旧 "0 0" 当成新目标重抓
+                                _flush_camera_uart(serial)
+                                data["value"] = None
+                                _awaiting_new_target = True  # 必须先收到新目标的真实追踪帧才允许下一次抓取
+
                                 grab_cooldown = True
                                 grab_cooldown_time = time.time()
                                 
