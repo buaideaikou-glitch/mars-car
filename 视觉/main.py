@@ -414,6 +414,7 @@ def phase_detect_and_send():
             
             # ====== 正常识别调整 ======
             block = None
+            is_stale = False
             
             if locked_block is not None:
                 tracked = find_locked_block(img, color_en, locked_block)
@@ -425,6 +426,7 @@ def phase_detect_and_send():
                     lock_lost_count += 1
                     if lock_lost_count < LOCK_LOST_TOLERANCE:
                         block = locked_block
+                        is_stale = True
                     else:
                         print(f"[LOST] 丢失{lock_lost_count}帧，重新搜索")
                         locked_block = None
@@ -443,7 +445,10 @@ def phase_detect_and_send():
                 dx = int(block['center_x'] - center_x)
                 dy = int(block['center_y'] - center_y)
                 
-                if abs(dx) <= ALIGN_THRESHOLD and abs(dy) <= ALIGN_THRESHOLD:
+                if is_stale:
+                    align_count = 0
+                    send_offset(dx, dy)
+                elif abs(dx) <= ALIGN_THRESHOLD and abs(dy) <= ALIGN_THRESHOLD:
                     align_count += 1
                     if align_count >= ALIGN_COUNT_NEEDED:
                         print(f"[ALIGN] {color_cn} 第{grab_count+1}块 已对准! dx={dx:+d} dy={dy:+d}")
