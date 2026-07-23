@@ -35,6 +35,15 @@ backup_mode = False        # 后退模式：True=正在后退拉开dy
 backup_done = False        # 本周期已后退过，防止对齐时再次触发
 reverse_mode = False       # 后退避让模式（带滞回），防止dy≈10时转向角跳变震荡
 
+# ===== 自动循迹模式相关变量 =====
+line_track_mode = False    # 是否处于自动循迹模式
+line_track_lost = False    # 绿线是否丢失
+line_track_lost_time = 0   # 丢失开始时间
+_LINE_TRACK_SPEED = 0.5    # 循迹前进速度 (rad/s)
+_LINE_TRACK_MAX_STEER = 90.0  # 循迹最大转向角 (deg)
+_LINE_TRACK_DX_THRESHOLD = 15  # dx阈值，小于此值直行
+_LINE_TRACK_LOST_TIMEOUT = 2.0  # 丢失超时自动退出 (秒)
+
 # 抓取/放置过程中使用的固定参数
 _GRIPPER_SERVO_ID = 15       # 夹爪舵机 ID（与 L1/R1 手动控制一致）
 _GRIPPER_OPEN_DEG = 0.0      # 夹爪松开角度（对应 L1）
@@ -240,9 +249,11 @@ def handle_arm_control(rover, ps2, buttons, lx, ly, rx, ry):
 # ==============================================================================
 def ps2_loop(rover, ps2, data, serial):
     global grab_mode, grab_cooldown, grab_cooldown_time, backup_mode, backup_done, reverse_mode
+    global line_track_mode, line_track_lost, line_track_lost_time
     
     print("PS2 控制：X失能，三角使能，R1停车，R2+右摇杆左右原地转向，L2+O机械臂回初始位并相机回0，L2+方向键左右控制相机，上下控制Pitch3，L2+左摇杆前后控制Pitch2，右摇杆前后控制Pitch1，右摇杆左右控制Roll。")
     print("方框键：切换自动抓取模式")
+    print("❌键：切换自动循迹模式（沿绿线行走）")
     print("START键：打印 12/13/14/15 号舵机当前角度")
     arm_mode_active = False
     
@@ -381,7 +392,7 @@ def ps2_loop(rover, ps2, data, serial):
                                 if reverse_mode:
                                     speed = -speed
                                     angle = -math.degrees(math.atan2(dx, dy))
-                                
+
                                 rover.drive(speed_rad_s=speed, steer_angle_deg=angle)
                                 
                             # ===== 阶段3：抓取 =====
@@ -493,7 +504,7 @@ def ps2_loop(rover, ps2, data, serial):
                                 
                                 grab_cooldown = True
                                 grab_cooldown_time = time.time()
-                                
+
                         except Exception as e:
                             pass
             
@@ -522,11 +533,102 @@ def ps2_loop(rover, ps2, data, serial):
             time.sleep_ms(100)
             continue
 
-        # 【CROSS 键】电机失能
+        # 【CROSS 键】切换自动循迹模式（沿绿线行走）
         if button_pressed(buttons, ps2.PS2_BTN_CROSS):
-            rover.disable()
-            arm_mode_active = False
-            time.sleep_ms(200)
+            line_track_mode = not line_track_mode
+            if line_track_mode:
+                print("🟢 进入自动循迹模式（沿绿线行走）")
+                rover.stop()
+                grab_mode = False
+                arm_mode_active = False
+                line_track_lost = False
+                line_track_lost_time = 0
+                data["value"] = None  # 清除残留数据
+                try:
+                    serial.write(b"track_start\n")
+                    print("[UART TX] 发送 track_start")
+                except:
+                    pass
+            else:
+                print("⏹️ 退出自动循迹模式")
+                rover.stop()
+                try:
+                    serial.write(b"track_stop\n")
+                    print("[UART TX] 发送 track_stop")
+                except:
+                    pass
+            time.sleep_ms(300)  # 防抖
+            continue
+
+        # ==========================================================
+        # 自动循迹模式的控制逻辑
+        # ==========================================================
+        if line_track_mode:
+            serial_data = data["value"]
+            if serial_data is not None:
+                data["value"] = None
+                parts = serial_data.strip().split()
+                if len(parts) == 2:
+                    try:
+                        dx = int(parts[0])
+                        angle = int(parts[1])
+                        
+                        # ===== 绿线丢失巡游 =====
+                        if dx == 999:
+                            if not line_track_lost:
+                                line_track_lost = True
+                                line_track_lost_time = time.time()
+                                print("🔍 绿线丢失，原地缓慢搜索...")
+                            
+                            # 丢失超时自动退出循迹
+                            if time.time() - line_track_lost_time > _LINE_TRACK_LOST_TIMEOUT:
+                                print("⏰ 绿线丢失超时，自动退出循迹模式")
+                                line_track_mode = False
+                                rover.stop()
+                                try:
+                                    serial.write(b"track_stop\n")
+                                except:
+                                    pass
+                                continue
+                            
+                            # 原地小角度左右搜索
+                            rover.drive(speed_rad_s=0.0, steer_angle_deg=30.0)
+                            time.sleep_ms(100)
+                            rover.drive(speed_rad_s=0.0, steer_angle_deg=-30.0)
+                            time.sleep_ms(100)
+                        
+                        # ===== 正常循迹 =====
+                        else:
+                            line_track_lost = False
+                            
+                            # 基于dx计算转向角
+                            # dx>0: 线在右侧，需右转（正转向角）
+                            # dx<0: 线在左侧，需左转（负转向角）
+                            steer_angle = 0.0
+                            if abs(dx) > _LINE_TRACK_DX_THRESHOLD:
+                                # P控制：转向角与dx成正比
+                                steer_ratio = dx / 320.0  # 归一化（图像半宽320）
+                                steer_ratio = clamp(steer_ratio, -1.0, 1.0)
+                                steer_angle = steer_ratio * _LINE_TRACK_MAX_STEER
+                            
+                            # 叠加线的角度信息（angle表示线的弯曲方向）
+                            steer_angle += angle * 0.5
+                            steer_angle = clamp(steer_angle, -_LINE_TRACK_MAX_STEER, _LINE_TRACK_MAX_STEER)
+                            
+                            # 速度调节：转弯越大速度越慢
+                            speed = _LINE_TRACK_SPEED * (1.0 - abs(steer_angle) / _LINE_TRACK_MAX_STEER * 0.5)
+                            if speed < 0.1:
+                                speed = 0.1
+                            
+                            rover.drive(speed_rad_s=speed, steer_angle_deg=steer_angle)
+                            
+                            if abs(dx) > 50:
+                                print(f"🟢 循迹: dx={dx:+d} angle={angle:+d} → 转向={steer_angle:+.1f}° 速度={speed:.2f}")
+                    
+                    except Exception as e:
+                        pass
+            
+            time.sleep_ms(30)
             continue
 
         # 【TRIANGLE 键】电机使能
@@ -557,4 +659,3 @@ def ps2_loop(rover, ps2, data, serial):
         
         rover.drive(speed_rad_s, steer_angle_deg)
         time.sleep_ms(50)
-

@@ -1,6 +1,7 @@
 from maix import camera, display, image, uart, app, time
 import threading
 import re
+import math
 
 # ============ 全局变量 ============
 stuts = ""
@@ -17,6 +18,7 @@ send_success_time = 0
 send_data = ""
 locked_block = None
 system_active = False
+line_track_mode = False  # 自动循迹模式标志
 
 # 对准容差
 ALIGN_THRESHOLD = 5
@@ -56,6 +58,11 @@ color_draw = {
     "pink": image.COLOR_BLACK
 }
 
+# ============ 绿色线LAB阈值（待填写） ============
+# TODO: 请在此处填写绿色线的LAB颜色阈值
+# 格式: [[L_min, L_max, A_min, A_max, B_min, B_max]]
+green_line_thresholds = [[55, 70,-30, -10,-35, -20]]
+
 # ============ 初始化 ============
 cam_block = camera.Camera(640, 480)
 disp = display.Display()
@@ -64,7 +71,7 @@ device = "/dev/ttyS0"
 serial = uart.UART(device, 115200)
 
 def uart_receive_thread(serial):
-    global stuts, car_grab_ok
+    global stuts, car_grab_ok, line_track_mode
     while True:
         data = serial.read()
         if data:
@@ -72,6 +79,13 @@ def uart_receive_thread(serial):
                 decoded = data.decode("utf-8", errors="ignore").strip()
                 if decoded:
                     stuts = decoded
+                    
+                    if "track_start" in decoded.lower():
+                        line_track_mode = True
+                        print("[UART RX] 收到track_start，进入自动循迹模式")
+                    elif "track_stop" in decoded.lower():
+                        line_track_mode = False
+                        print("[UART RX] 收到track_stop，退出自动循迹模式")
                     
                     if "ok" in decoded.lower():
                         car_grab_ok = True
@@ -163,6 +177,105 @@ def parse_qr_task(qr_text):
     print("[TASK] 解析失败")
     return False
 
+def detect_green_line(img):
+    """
+    检测绿色线，返回 (dx, angle) 或 None
+    dx: 线中心相对于图像中心的水平偏移（正=右，负=左）
+    angle: 线的角度（正=向右弯，负=向左弯，0=直行）
+    """
+    blobs = img.find_blobs(green_line_thresholds, pixels_threshold=30, area_threshold=30, merge=True)
+    
+    if not blobs:
+        return None
+    
+    mid_y = 240  # 图像中线（640x480）
+    
+    top_cx_sum = 0.0
+    top_weight = 0
+    bottom_cx_sum = 0.0
+    bottom_weight = 0
+    all_cx_sum = 0.0
+    all_cy_sum = 0.0
+    all_weight = 0
+    
+    for blob in blobs:
+        cx, cy = blob[5], blob[6]
+        weight = blob[4]  # 像素数
+        
+        all_cx_sum += cx * weight
+        all_cy_sum += cy * weight
+        all_weight += weight
+        
+        if cy < mid_y:
+            top_cx_sum += cx * weight
+            top_weight += weight
+        else:
+            bottom_cx_sum += cx * weight
+            bottom_weight += weight
+        
+        img.draw_rect(blob[0], blob[1], blob[2], blob[3], image.COLOR_GREEN, 2)
+    
+    if all_weight == 0:
+        return None
+    
+    overall_cx = all_cx_sum / all_weight
+    overall_cy = all_cy_sum / all_weight
+    
+    dx = int(overall_cx - center_x)
+    
+    angle = 0
+    if top_weight > 0 and bottom_weight > 0:
+        top_avg = top_cx_sum / top_weight
+        bottom_avg = bottom_cx_sum / bottom_weight
+        angle = int(math.degrees(math.atan2(top_avg - bottom_avg, mid_y)))
+    
+    # 绘制线中心和方向
+    img.draw_cross(int(overall_cx), int(overall_cy), image.COLOR_RED, size=15, thickness=2)
+    if top_weight > 0 and bottom_weight > 0:
+        top_avg = top_cx_sum / top_weight
+        bottom_avg = bottom_cx_sum / bottom_weight
+        img.draw_line(int(bottom_avg), mid_y, int(top_avg), 0, image.COLOR_YELLOW, 3)
+    
+    return dx, angle
+
+def line_track_loop():
+    global line_track_mode
+    
+    print("\n" + "="*50)
+    print("自动循迹模式：绿色线跟踪")
+    print("="*50)
+    
+    while line_track_mode and not app.need_exit():
+        img = cam_block.read()
+        
+        result = detect_green_line(img)
+        
+        if result:
+            dx, angle = result
+            data = f"{dx} {angle}\n"
+            try:
+                serial.write_str(data)
+            except:
+                pass
+            
+            img.draw_string(10, 10, "自动循迹中", image.COLOR_GREEN, 1.5)
+            img.draw_string(10, 30, f"dx={dx:+d} angle={angle:+d}", image.COLOR_GREEN, 1.5)
+        else:
+            data = "999 0\n"
+            try:
+                serial.write_str(data)
+            except:
+                pass
+            
+            img.draw_string(10, 10, "自动循迹中", image.COLOR_RED, 1.5)
+            img.draw_string(10, 30, "绿线丢失!", image.COLOR_RED, 1.5)
+        
+        img.draw_cross(center_x, center_y, image.COLOR_WHITE, size=20, thickness=2)
+        img.draw_circle(center_x, center_y, 8, image.COLOR_WHITE, 2)
+        
+        disp.show(img)
+        time.sleep(0.02)
+
 def phase_qr_scan():
     global task_parsed
     
@@ -170,7 +283,7 @@ def phase_qr_scan():
     print("阶段1: 扫描二维码")
     print("="*50)
     
-    while not task_parsed and not app.need_exit():
+    while not task_parsed and not app.need_exit() and not line_track_mode:
         img = cam_block.read()
         qrcodes = img.find_qrcodes()
         
@@ -367,7 +480,7 @@ def phase_detect_and_send():
         print(f"[TASK] {color_cn}: {count}块 ({idx+1}/{len(task_queue)})")
         print(f"{'='*30}")
         
-        while grab_count < remaining_count and not app.need_exit():
+        while grab_count < remaining_count and not app.need_exit() and not line_track_mode:
             img = cam_block.read()
             
             # ====== 收到ok，抓取完成 ======
@@ -504,6 +617,11 @@ waiting_ok = False
 car_grab_ok = False
 
 while not app.need_exit():
+    # 检查自动循迹模式
+    if line_track_mode:
+        line_track_loop()
+        continue
+    
     task_parsed = False
     grabbed_positions.clear()
     grabbed_block_pos = None
@@ -516,9 +634,9 @@ while not app.need_exit():
     if task_parsed and len(task_queue) > 0:
         phase_detect_and_send()
     
-    print("\\n[INFO] 返回初始状态，等待扫描新二维码...")
+    print("\n[INFO] 返回初始状态，等待扫描新二维码...")
     for _ in range(30):
-        if app.need_exit():
+        if app.need_exit() or line_track_mode:
             break
         img = cam_block.read()
         img.draw_string(180, 200, "扫描新二维码...", image.COLOR_GREEN, 2.5)
