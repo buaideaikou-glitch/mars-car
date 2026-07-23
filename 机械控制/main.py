@@ -14,7 +14,6 @@
 """
 import time, _thread, sys, machine
 time.sleep(3)
-
 from machine import UART
 from esp32 import CAN
 from ps2_lib import PS2Controller, PS2Receiver

@@ -40,32 +40,12 @@ LOCK_LOST_TOLERANCE = 10
 lock_lost_count = 0
 
 # ============ 色块识别阈值 ============
-thresholds = {
-    "red": [
-        [0, 35, 30, 80, 18, 62],       # 红色下限
-        [23, 43, 45, 65, 26, 46],      # 中心红色：原22-42改为20-44，给±2的抖动空间
-        [148, 180, 38, 80, 28, 62]     # 红色高H
-    ],
-    "blue": [
-        [18, 47, -22, 22, -62, -18],   # 蓝色扩展范围
-        [32, 52, -10, 10, -53, -33],   # 中心蓝色：原29-49改为27-51，给±2的抖动空间
-        [8, 42, -32, 2, -72, -38]      # 暗部蓝色
-    ],
-    "yellow": [
-        [48, 87, -18, 18, 48, 92],     # 黄色扩展范围
-        [52, 72, -6, 14, 56, 76],     # 中心黄色：根据57,77采样，给±2空间
-        [42, 72, -22, 22, 42, 98]      # 亮/暗部黄色
-    ],
-    "purple": [
-        [6, 26, 23, 43, -43, -23],     # 中心紫色：根据1,21采样，给±2空间
-        [0, 37, 33, 72, -92, -48],     # 紫色扩展
-        [13, 42, 28, 52, -72, -38]     # 中间紫色
-    ],
-    "pink": [
-        [38, 72, 3, 37, -62, -18],     # 粉色扩展
-        [54, 74, 17, 37, -8, 12],      # 中心粉色：原41-61改为39-63，给±2空间
-        [33, 62, -3, 28, -72, -38]     # 暗部粉色
-    ]
+thresholds = {  
+    "red":    [[20, 60, 35, 80, 10, 40]],
+    "blue":   [[40, 60, 5 ,25, -80, -60]],
+    "yellow": [[50, 100, -30, 10, 60, 100]],
+    "pink":   [[60, 80, 5, 20, -40, -10]],
+    "purple": [[5, 30, 20, 45, -70, -35]]
 }
 
 color_draw = {
@@ -77,7 +57,6 @@ color_draw = {
 }
 
 # ============ 初始化 ============
-cam_qr = camera.Camera(320, 240)
 cam_block = camera.Camera(640, 480)
 disp = display.Display()
 
@@ -92,12 +71,11 @@ def uart_receive_thread(serial):
             try:
                 decoded = data.decode("utf-8", errors="ignore").strip()
                 if decoded:
-                    print(f"[UART RX] {decoded}")
                     stuts = decoded
                     
                     if "ok" in decoded.lower():
                         car_grab_ok = True
-                        print("[UART RX] ✅ 收到ok！")
+                        print("[UART RX] ✅ 收到有效的抓取完成ok！")
             except:
                 pass
         time.sleep(0.01)
@@ -193,7 +171,7 @@ def phase_qr_scan():
     print("="*50)
     
     while not task_parsed and not app.need_exit():
-        img = cam_qr.read()
+        img = cam_block.read()
         qrcodes = img.find_qrcodes()
         
         for qr in qrcodes:
@@ -213,18 +191,13 @@ def phase_qr_scan():
         
         img.draw_string(10, 10, "扫描二维码中...", image.COLOR_GREEN, 1.5)
         disp.show(img)
-        time.sleep(0.1)
+        time.sleep(0.02)
 
 def find_blocks_by_color(img, target_color):
     if target_color not in thresholds:
         return []
     
-    all_blobs = []
-    for thresh in thresholds[target_color]:
-        blobs = img.find_blobs([thresh], pixels_threshold=200, area_threshold=300, merge=True)
-        if blobs:
-            all_blobs.extend(blobs)
-    
+    all_blobs = img.find_blobs(thresholds[target_color], pixels_threshold=200, area_threshold=300, merge=True)
     if not all_blobs:
         return []
     
@@ -436,11 +409,12 @@ def phase_detect_and_send():
                 draw_ui(img, locked_block, color_en, grab_count, remaining_count,
                        locked_block is not None, align_count, lock_lost_count)
                 disp.show(img)
-                time.sleep(0.05)
+                time.sleep(0.01)
                 continue
             
             # ====== 正常识别调整 ======
             block = None
+            is_stale = False
             
             if locked_block is not None:
                 tracked = find_locked_block(img, color_en, locked_block)
@@ -452,6 +426,7 @@ def phase_detect_and_send():
                     lock_lost_count += 1
                     if lock_lost_count < LOCK_LOST_TOLERANCE:
                         block = locked_block
+                        is_stale = True
                     else:
                         print(f"[LOST] 丢失{lock_lost_count}帧，重新搜索")
                         locked_block = None
@@ -470,7 +445,10 @@ def phase_detect_and_send():
                 dx = int(block['center_x'] - center_x)
                 dy = int(block['center_y'] - center_y)
                 
-                if abs(dx) <= ALIGN_THRESHOLD and abs(dy) <= ALIGN_THRESHOLD:
+                if is_stale:
+                    align_count = 0
+                    send_offset(dx, dy)
+                elif abs(dx) <= ALIGN_THRESHOLD and abs(dy) <= ALIGN_THRESHOLD:
                     align_count += 1
                     if align_count >= ALIGN_COUNT_NEEDED:
                         print(f"[ALIGN] {color_cn} 第{grab_count+1}块 已对准! dx={dx:+d} dy={dy:+d}")
@@ -496,12 +474,16 @@ def phase_detect_and_send():
             draw_ui(img, block, color_en, grab_count, remaining_count,
                    locked_block is not None, align_count, lock_lost_count)
             disp.show(img)
-            time.sleep(0.05)
+            time.sleep(0.01)
     
     print("\\n" + "="*50)
     print("[TASK_COMPLETE] 所有任务完成")
     print("="*50)
-    
+
+    # 通知ESP32所有任务完成，自动退出抓取模式
+    serial.write_str("finish\n")
+    print("[UART TX] 发送finish → ESP32退出抓取模式")
+
     system_active = False
     waiting_ok = False
     current_color = None
@@ -510,7 +492,7 @@ def phase_detect_and_send():
         if app.need_exit():
             break
         img = cam_block.read()
-        img.draw_rectangle(0, 0, 640, 480, image.COLOR_BLACK, -1)
+        img.draw_rect(0, 0, 640, 480, image.COLOR_BLACK, -1)
         img.draw_string(180, 200, "所有任务完成!", image.COLOR_GREEN, 2.5)
         img.draw_string(200, 250, "系统已停止", image.COLOR_RED, 2)
         disp.show(img)
