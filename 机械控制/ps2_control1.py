@@ -33,6 +33,7 @@ grab_cooldown_time = 0     # 冷却开始时间
 row = 1.5
 backup_mode = False        # 后退模式：True=正在后退拉开dy
 backup_done = False        # 本周期已后退过，防止对齐时再次触发
+reverse_mode = False       # 后退避让模式（带滞回），防止dy≈10时转向角跳变震荡
 
 # 抓取/放置过程中使用的固定参数
 _GRIPPER_SERVO_ID = 15       # 夹爪舵机 ID（与 L1/R1 手动控制一致）
@@ -238,7 +239,7 @@ def handle_arm_control(rover, ps2, buttons, lx, ly, rx, ry):
 # 主循环控制：演示如何从底层获取摇杆信息
 # ==============================================================================
 def ps2_loop(rover, ps2, data, serial):
-    global grab_mode, grab_cooldown, grab_cooldown_time, backup_mode, backup_done
+    global grab_mode, grab_cooldown, grab_cooldown_time, backup_mode, backup_done, reverse_mode
     
     print("PS2 控制：X失能，三角使能，R1停车，R2+右摇杆左右原地转向，L2+O机械臂回初始位并相机回0，L2+方向键左右控制相机，上下控制Pitch3，L2+左摇杆前后控制Pitch2，右摇杆前后控制Pitch1，右摇杆左右控制Roll。")
     print("方框键：切换自动抓取模式")
@@ -289,6 +290,11 @@ def ps2_loop(rover, ps2, data, serial):
                 grab_cooldown = False
                 grab_cooldown_time = 0
                 data["value"] = None  # 清除残留的finish信号
+                if rover.arm is not None:
+                    try:
+                        rover.arm.sync_camera_from_servo()
+                    except ArmKinematicsError as err:
+                        print_arm_error(err)
             else:
                 print("⏹️ 退出抓取模式")
                 rover.stop()
@@ -330,6 +336,7 @@ def ps2_loop(rover, ps2, data, serial):
                             if dx == 999 and dy == 999:
                                 backup_mode = False
                                 backup_done = False
+                                reverse_mode = False
                                 print("🔍 目标丢失，巡游中...")
                                 row *= -1
                                 rover.servo_control.set_steering_angles(90.0, 90.0, 90.0, 90.0, 90.0, 90.0)
@@ -364,8 +371,14 @@ def ps2_loop(rover, ps2, data, serial):
                                 if speed > 0.4: speed = 0.4
                                 if speed < 0.15: speed = 0.15
                                 
-                                # dy>10 目标在下方（近）→ 后退；否则前进/蟹行
-                                if dy > 10:
+                                # dy过大 目标在下方（近）→ 后退避让；否则前进/蟹行
+                                # 滞回：dy>15进入后退，dy<5恢复前进，中间保持当前模式
+                                if dy > 15:
+                                    reverse_mode = True
+                                elif dy < 5:
+                                    reverse_mode = False
+
+                                if reverse_mode:
                                     speed = -speed
                                     angle = -math.degrees(math.atan2(dx, dy))
                                 
@@ -374,6 +387,7 @@ def ps2_loop(rover, ps2, data, serial):
                             # ===== 阶段3：抓取 =====
                             elif abs(dx) <= 10 and abs(dy) <= 10:
                                 backup_done = False
+                                reverse_mode = False
                                 rover.stop()
                                 rover.center_chassis_servos()
                                 time.sleep_ms(300)

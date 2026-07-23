@@ -40,11 +40,11 @@ LOCK_LOST_TOLERANCE = 10
 lock_lost_count = 0
 
 # ============ 色块识别阈值 ============
-thresholds = {
+thresholds = {  
     "red":    [[20, 60, 35, 80, 10, 40]],
     "blue":   [[25, 70, -20, 15, -75, -25]],
     "yellow": [[50, 100, -30, 10, 60, 100]],
-    "pink":   [[30, 80, 10, 30, -40, 0]],
+    "pink":   [[60, 80, 5, 20, -40, -10]],
     "purple": [[5, 30, 20, 45, -70, -35]]
 }
 
@@ -191,18 +191,13 @@ def phase_qr_scan():
         
         img.draw_string(10, 10, "扫描二维码中...", image.COLOR_GREEN, 1.5)
         disp.show(img)
-        time.sleep(0.1)
+        time.sleep(0.02)
 
 def find_blocks_by_color(img, target_color):
     if target_color not in thresholds:
         return []
     
-    all_blobs = []
-    for thresh in thresholds[target_color]:
-        blobs = img.find_blobs([thresh], pixels_threshold=200, area_threshold=300, merge=True)
-        if blobs:
-            all_blobs.extend(blobs)
-    
+    all_blobs = img.find_blobs(thresholds[target_color], pixels_threshold=200, area_threshold=300, merge=True)
     if not all_blobs:
         return []
     
@@ -414,7 +409,7 @@ def phase_detect_and_send():
                 draw_ui(img, locked_block, color_en, grab_count, remaining_count,
                        locked_block is not None, align_count, lock_lost_count)
                 disp.show(img)
-                time.sleep(0.05)
+                time.sleep(0.01)
                 continue
             
             # ====== 正常识别调整 ======
@@ -474,7 +469,7 @@ def phase_detect_and_send():
             draw_ui(img, block, color_en, grab_count, remaining_count,
                    locked_block is not None, align_count, lock_lost_count)
             disp.show(img)
-            time.sleep(0.05)
+            time.sleep(0.01)
     
     print("\\n" + "="*50)
     print("[TASK_COMPLETE] 所有任务完成")
