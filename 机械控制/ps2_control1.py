@@ -304,6 +304,8 @@ def ps2_loop(rover, ps2, data, serial):
                     data["value"] = None
                     parts = serial_data.strip().split()
                     if len(parts) == 2:
+                        saved_cam_angle = 0.0
+                        camera_moved = False
                         try:
                             dx = int(parts[0])
                             dy = int(parts[1])
@@ -368,86 +370,118 @@ def ps2_loop(rover, ps2, data, serial):
                                     except ArmKinematicsError as err:
                                         print_arm_error(err)
                                     time.sleep_ms(500)
+                                    camera_moved = True
                                 
                                 # 机械臂抓取放置（固定原始舵机角度，与 START 打印一致）
-                                if rover.arm is not None:
-                                    # 1) 过渡位姿 1：7=-19.9, 9=-0.1, 10=-140.9, 11=0
-                                    print("🦾 运动到过渡位姿 1")
-                                    _move_arm_servos(
-                                        rover,
-                                        ((7, -19.9), (9, -0.1), (10, -140.9), (11, 0.0)),
-                                        speed_deg_s=_ARM_GRAB_SPEED,
-                                    )
-                                    # 2) 过渡位姿 2：7=-36.8, 9=-1.7, 10=-131.2, 11=0
-                                    print("🦾 运动到过渡位姿 2")
-                                    _move_arm_servos(
-                                        rover,
-                                        ((7, -36.8), (9, -1.7), (10, -131.2), (11, 0.0)),
-                                        speed_deg_s=_ARM_GRAB_SPEED,
-                                    )
-                                    # 3) 运动到抓取姿态：7=-59.2, 9=0, 10=-116.7, 11=0.1
-                                    print("🦾 运动到抓取姿态")
-                                    _move_arm_servos(
-                                        rover,
-                                        ((7, -59.2), (9, 0.0), (10, -116.7), (11, 0.1)),
-                                        speed_deg_s=_ARM_GRAB_SPEED,
-                                    )
-                                    # 夹爪保持夹紧
-                                    rover.servo_control.set_reserve_servo_angle(
-                                        _GRIPPER_SERVO_ID, _GRIPPER_CLOSE_DEG, speed_deg_s=60.0
-                                    )
-                                    time.sleep_ms(_GRIPPER_SETTLE_MS)
+                                # 用 try/finally 保证：即使抓取过程中舵机通讯异常，
+                                # 相机也一定会恢复、ok 一定会发送、冷却一定会设置。
+                                try:
+                                    if rover.arm is not None:
+                                        # 1) 过渡位姿 1：7=-19.9, 9=-0.1, 10=-140.9, 11=0
+                                        print("🦾 运动到过渡位姿 1")
+                                        _move_arm_servos(
+                                            rover,
+                                            ((7, -19.9), (9, -0.1), (10, -140.9), (11, 0.0)),
+                                            speed_deg_s=_ARM_GRAB_SPEED,
+                                        )
+                                        # 2) 过渡位姿 2：7=-36.8, 9=-1.7, 10=-131.2, 11=0
+                                        print("🦾 运动到过渡位姿 2")
+                                        _move_arm_servos(
+                                            rover,
+                                            ((7, -36.8), (9, -1.7), (10, -131.2), (11, 0.0)),
+                                            speed_deg_s=_ARM_GRAB_SPEED,
+                                        )
+                                        # 3) 运动到抓取姿态：7=-59.2, 9=0, 10=-116.7, 11=0.1
+                                        print("🦾 运动到抓取姿态")
+                                        _move_arm_servos(
+                                            rover,
+                                            ((7, -59.2), (9, 0.0), (10, -116.7), (11, 0.1)),
+                                            speed_deg_s=_ARM_GRAB_SPEED,
+                                        )
+                                        # 夹爪保持夹紧
+                                        rover.servo_control.set_reserve_servo_angle(
+                                            _GRIPPER_SERVO_ID, _GRIPPER_CLOSE_DEG, speed_deg_s=60.0
+                                        )
+                                        time.sleep_ms(_GRIPPER_SETTLE_MS)
 
-                                    # 4) 运动到放置姿态：7=-24.2, 9=0.0, 10=122.7, 11=0.4
-                                    print("📦 运动到放置姿态")
-                                    _move_arm_servos(
-                                        rover,
-                                        ((7, -24.2), (9, 0.0), (10, 122.7), (11, 0.4)),
-                                        speed_deg_s=_ARM_GRAB_SPEED,
-                                    )
-                                    # 夹爪松开
-                                    rover.servo_control.set_reserve_servo_angle(
-                                        _GRIPPER_SERVO_ID, _GRIPPER_OPEN_DEG, speed_deg_s=60.0
-                                    )
-                                    time.sleep_ms(_GRIPPER_SETTLE_MS)
-                                
-                                # 机械臂复位
-                                if rover.arm is not None:
-                                    _pre_reset = dict(
-                                        rover.servo_control.servo_bus.read_angles(_ARM_SERVO_IDS)
-                                    )
+                                        # 4) 运动到放置姿态：7=-24.2, 9=0.0, 10=122.7, 11=0.4
+                                        print("📦 运动到放置姿态")
+                                        _move_arm_servos(
+                                            rover,
+                                            ((7, -24.2), (9, 0.0), (10, 122.7), (11, 0.4)),
+                                            speed_deg_s=_ARM_GRAB_SPEED,
+                                        )
+                                        # 夹爪松开
+                                        rover.servo_control.set_reserve_servo_angle(
+                                            _GRIPPER_SERVO_ID, _GRIPPER_OPEN_DEG, speed_deg_s=60.0
+                                        )
+                                        time.sleep_ms(_GRIPPER_SETTLE_MS)
+                                except Exception as _grab_err:
+                                    print("⚠️ 抓取过程中异常：", _grab_err)
+                                finally:
+                                    # ===== 机械臂复位（独立 try，失败不影响后续相机恢复）=====
+                                    if rover.arm is not None:
+                                        try:
+                                            _pre_reset = dict(
+                                                rover.servo_control.servo_bus.read_angles(_ARM_SERVO_IDS)
+                                            )
+                                        except Exception as err:
+                                            print("读取机械臂角度失败：", err)
+                                            _pre_reset = {}
+                                        try:
+                                            rover.arm.apply_initial_pose()
+                                        except ArmKinematicsError as err:
+                                            print_arm_error(err)
+                                        # 初始位对应的原始舵机角度（与 robot_config 的 ARM_INIT_* 对应：
+                                        # 7=PITCH1=50, 9=ROLL=0, 10=PITCH2=-140, 11=PITCH3=0）
+                                        _reset_max_delta = 0.0
+                                        for _sid, _tgt in ((7, 50.0), (9, 0.0), (10, -140.0), (11, 0.0)):
+                                            _cur = _pre_reset.get(_sid)
+                                            if _cur is not None:
+                                                _reset_max_delta = max(_reset_max_delta, abs(_tgt - float(_cur)))
+                                        time.sleep_ms(int(_reset_max_delta / _ARM_GRAB_SPEED * 1000) + 400)
+                                        try:
+                                            rover.servo_control.init_reserve_servos()
+                                        except Exception as err:
+                                            print("预留舵机复位失败：", err)
+                                        time.sleep_ms(_GRIPPER_SETTLE_MS)
+
+                                    # ===== 相机恢复到追踪时的角度（独立 try，确保一定执行）=====
+                                    if rover.arm is not None:
+                                        try:
+                                            rover.arm.jog_camera(saved_cam_angle - rover.arm.camera_angle_deg)
+                                        except ArmKinematicsError as err:
+                                            print_arm_error(err)
+
+                                    # ===== 发送 ok 并设置冷却（独立 try，确保一定执行）=====
+                                    print("✅ 抓取放置完成！")
                                     try:
-                                        rover.arm.apply_initial_pose()
-                                    except ArmKinematicsError as err:
-                                        print_arm_error(err)
-                                    # 初始位对应的原始舵机角度（与 robot_config 的 ARM_INIT_* 对应：
-                                    # 7=PITCH1=50, 9=ROLL=0, 10=PITCH2=-140, 11=PITCH3=0）
-                                    _reset_max_delta = 0.0
-                                    for _sid, _tgt in ((7, 50.0), (9, 0.0), (10, -140.0), (11, 0.0)):
-                                        _cur = _pre_reset.get(_sid)
-                                        if _cur is not None:
-                                            _reset_max_delta = max(_reset_max_delta, abs(_tgt - float(_cur)))
-                                    time.sleep_ms(int(_reset_max_delta / _ARM_GRAB_SPEED * 1000) + 400)
-                                    try:
-                                        rover.servo_control.init_reserve_servos()
+                                        serial.write(b"ok\n")
                                     except Exception as err:
-                                        print("预留舵机复位失败：", err)
-                                    time.sleep_ms(_GRIPPER_SETTLE_MS)
-                                    
-                                    # 相机恢复到追踪时的角度
-                                    try:
-                                        rover.arm.jog_camera(saved_cam_angle - rover.arm.camera_angle_deg)
-                                    except ArmKinematicsError as err:
-                                        print_arm_error(err)
-                                
-                                print("✅ 抓取放置完成！")
-                                serial.write(b"ok\n")
-                                
-                                grab_cooldown = True
-                                grab_cooldown_time = time.time()
+                                        print("发送ok失败：", err)
+
+                                    grab_cooldown = True
+                                    grab_cooldown_time = time.time()
                                 
                         except Exception as e:
-                            pass
+                            # 抓取过程中若发生异常，必须恢复相机角度并通知视觉端，
+                            # 否则摄像头会停留在移开位置无法回正
+                            print("⚠️ 处理过程异常：", e)
+                            if camera_moved:
+                                if rover.arm is not None:
+                                    try:
+                                        rover.arm.jog_camera(
+                                            saved_cam_angle - rover.arm.camera_angle_deg
+                                        )
+                                    except ArmKinematicsError as err:
+                                        print_arm_error(err)
+                                    time.sleep_ms(500)
+                                try:
+                                    serial.write(b"ok\n")
+                                except Exception:
+                                    pass
+                                grab_cooldown = True
+                                grab_cooldown_time = time.time()
             
             # 👇 核心救命代码：强制每次循环休息 30 毫秒，防止手柄通讯崩溃！
             time.sleep_ms(30)

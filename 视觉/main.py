@@ -85,21 +85,20 @@ device = "/dev/ttyS0"
 serial = uart.UART(device, 115200)
 
 def uart_receive_thread(serial):
-    global stuts, car_grab_ok, waiting_ok
-    while True:
-        data = serial.read()
-        if data:
-            try:
-                decoded = data.decode("utf-8", errors="ignore").strip()
-                if decoded:
-                    stuts = decoded
-                    
-                    if "ok" in decoded.lower() and waiting_ok:
-                        car_grab_ok = True
-                        print("[UART RX] ✅ 收到有效的抓取完成ok！")
-            except:
-                pass
-        time.sleep(0.01)
+    global stuts, car_grab_ok
+    data = serial.read()
+    if data:
+        try:
+            decoded = data.decode("utf-8", errors="ignore").strip()
+            if decoded:
+                stuts = decoded
+                
+                if "ok" in decoded.lower():
+                    car_grab_ok = True
+                    print("[UART RX] ✅ 收到有效的抓取完成ok！")
+        except:
+            pass
+    time.sleep(0.01)
 
 uart_thread = threading.Thread(target=uart_receive_thread, args=(serial,))
 uart_thread.daemon = True
