@@ -1,7 +1,6 @@
 from maix import camera, display, image, uart, app, time
 import threading
 import re
-import math
 
 # ============ 全局变量 ============
 stuts = ""
@@ -59,9 +58,16 @@ color_draw = {
 }
 
 # ============ 绿色线LAB阈值（待填写） ============
-# TODO: 请在此处填写绿色线的LAB颜色阈值
 # 格式: [[L_min, L_max, A_min, A_max, B_min, B_max]]
 green_line_thresholds = [[55, 70,-30, -10,-35, -20]]
+
+# ============ 循迹参数 ============
+BOTTOM_Y = 340           # 底部扫描区起始Y（近车，循迹转向）
+TURN_Y_MIN = 220         # 转弯检测区起始Y（靠近车辆时才触发）
+TURN_Y_MAX = 340         # 转弯检测区结束Y
+TURN_WIDTH_RATIO = 2.0   # 宽/高 > 此值判定为横线（90°拐弯）
+TURN_MIN_AREA = 800      # 横线最小面积
+LINE_MIN_AREA = 80       # 底部循迹线最小面积
 
 # ============ 初始化 ============
 cam_block = camera.Camera(640, 480)
@@ -177,104 +183,92 @@ def parse_qr_task(qr_text):
     print("[TASK] 解析失败")
     return False
 
-def detect_green_line(img):
+def find_green_in_roi(img, y_min, y_max):
+    """在指定Y范围内查找绿色色块，返回色块列表。"""
+    roi = (0, y_min, 640, y_max - y_min)
+    blobs = img.find_blobs(green_line_thresholds, pixels_threshold=30,
+                            area_threshold=50, merge=True, roi=roi)
+    return blobs if blobs else []
+
+def process_line(img):
     """
-    检测绿色线，返回 (dx, angle) 或 None
-    dx: 线中心相对于图像中心的水平偏移（正=右，负=左）
-    angle: 线的角度（正=向右弯，负=向左弯，0=直行）
+    检测绿色线，返回 (dx, status):
+      status=0: 循迹中, dx=线条中心与画面中心的水平偏移
+      status=1: 检测到左转90°（横线在左侧）
+      status=2: 检测到右转90°（横线在右侧）
+      status=3: 丢失线条
     """
-    blobs = img.find_blobs(green_line_thresholds, pixels_threshold=30, area_threshold=30, merge=True)
-    
-    if not blobs:
-        return None
-    
-    mid_y = 240  # 图像中线（640x480）
-    
-    top_cx_sum = 0.0
-    top_weight = 0
-    bottom_cx_sum = 0.0
-    bottom_weight = 0
-    all_cx_sum = 0.0
-    all_cy_sum = 0.0
-    all_weight = 0
-    
-    for blob in blobs:
-        cx, cy = blob[5], blob[6]
-        weight = blob[4]  # 像素数
-        
-        all_cx_sum += cx * weight
-        all_cy_sum += cy * weight
-        all_weight += weight
-        
-        if cy < mid_y:
-            top_cx_sum += cx * weight
-            top_weight += weight
-        else:
-            bottom_cx_sum += cx * weight
-            bottom_weight += weight
-        
-        img.draw_rect(blob[0], blob[1], blob[2], blob[3], image.COLOR_GREEN, 2)
-    
-    if all_weight == 0:
-        return None
-    
-    overall_cx = all_cx_sum / all_weight
-    overall_cy = all_cy_sum / all_weight
-    
-    dx = int(overall_cx - center_x)
-    
-    angle = 0
-    if top_weight > 0 and bottom_weight > 0:
-        top_avg = top_cx_sum / top_weight
-        bottom_avg = bottom_cx_sum / bottom_weight
-        angle = int(math.degrees(math.atan2(top_avg - bottom_avg, mid_y)))
-    
-    # 绘制线中心和方向
-    img.draw_cross(int(overall_cx), int(overall_cy), image.COLOR_RED, size=15, thickness=2)
-    if top_weight > 0 and bottom_weight > 0:
-        top_avg = top_cx_sum / top_weight
-        bottom_avg = bottom_cx_sum / bottom_weight
-        img.draw_line(int(bottom_avg), mid_y, int(top_avg), 0, image.COLOR_YELLOW, 3)
-    
-    return dx, angle
+    # 1. 底部区域：循迹转向
+    bottom_blobs = find_green_in_roi(img, BOTTOM_Y, 480)
+    bottom_cx = None
+    bottom_area = 0
+    if bottom_blobs:
+        largest = max(bottom_blobs, key=lambda b: b.area())
+        bottom_cx = largest.cx()
+        bottom_area = largest.area()
+        img.draw_rect(largest.x(), largest.y(), largest.w(), largest.h(), image.COLOR_GREEN, 2)
+        img.draw_cross(largest.cx(), largest.cy(), image.COLOR_GREEN, 8, 2)
+
+    # 2. 转弯检测区：检测横线（90°拐弯），区域靠近车辆避免过早触发
+    turn_blobs = find_green_in_roi(img, TURN_Y_MIN, TURN_Y_MAX)
+    turn = 0
+    if turn_blobs:
+        widest = max(turn_blobs, key=lambda b: b.w())
+        w, h = widest.w(), widest.h()
+        if w > h * TURN_WIDTH_RATIO and widest.area() > TURN_MIN_AREA:
+            if widest.cx() < center_x:
+                turn = 1
+            else:
+                turn = 2
+
+    # 3. 综合判断
+    if turn != 0:
+        return 0, turn
+    if bottom_cx is not None and bottom_area > LINE_MIN_AREA:
+        return bottom_cx - center_x, 0
+    return 0, 3
 
 def line_track_loop():
     global line_track_mode
-    
+
     print("\n" + "="*50)
     print("自动循迹模式：绿色线跟踪")
+    print("协议: <dx> <status>  0=循迹 1=左转 2=右转 3=丢失")
     print("="*50)
-    
+
+    last_send = 0
     while line_track_mode and not app.need_exit():
         img = cam_block.read()
-        
-        result = detect_green_line(img)
-        
-        if result:
-            dx, angle = result
-            data = f"{dx} {angle}\n"
+        dx, status = process_line(img)
+
+        # 发送数据 (10Hz)
+        current_time = time.time()
+        if current_time - last_send >= 0.1:
+            msg = f"{dx} {status}\n"
             try:
-                serial.write_str(data)
+                serial.write_str(msg)
             except:
                 pass
-            
-            img.draw_string(10, 10, "自动循迹中", image.COLOR_GREEN, 1.5)
-            img.draw_string(10, 30, f"dx={dx:+d} angle={angle:+d}", image.COLOR_GREEN, 1.5)
-        else:
-            data = "999 0\n"
-            try:
-                serial.write_str(data)
-            except:
-                pass
-            
-            img.draw_string(10, 10, "自动循迹中", image.COLOR_RED, 1.5)
-            img.draw_string(10, 30, "绿线丢失!", image.COLOR_RED, 1.5)
-        
-        img.draw_cross(center_x, center_y, image.COLOR_WHITE, size=20, thickness=2)
-        img.draw_circle(center_x, center_y, 8, image.COLOR_WHITE, 2)
-        
+            last_send = current_time
+
+        # 绘制UI
+        img.draw_line(0, BOTTOM_Y, 640, BOTTOM_Y, image.COLOR_YELLOW, 1)
+        img.draw_line(0, TURN_Y_MIN, 640, TURN_Y_MIN, image.COLOR_BLUE, 1)
+        img.draw_line(0, TURN_Y_MAX, 640, TURN_Y_MAX, image.COLOR_BLUE, 1)
+        img.draw_line(center_x, 0, center_x, 480, image.COLOR_WHITE, 1)
+
+        if status == 0:
+            color = image.COLOR_GREEN if abs(dx) < 30 else image.COLOR_YELLOW
+            img.draw_string(10, 10, f"循迹 dx={dx}", color, 1.5)
+        elif status == 1:
+            img.draw_string(10, 10, "<- 左转", image.COLOR_RED, 2.5)
+        elif status == 2:
+            img.draw_string(10, 10, "右转 ->", image.COLOR_RED, 2.5)
+        elif status == 3:
+            img.draw_string(10, 10, "丢失线条!", image.COLOR_RED, 2)
+
         disp.show(img)
-        time.sleep(0.02)
+        time.sleep(0.01)
 
 def phase_qr_scan():
     global task_parsed
